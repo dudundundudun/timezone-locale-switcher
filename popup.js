@@ -4,6 +4,7 @@ const {
   PROFILE_GROUPS,
   PROFILE_LIST,
   DEFAULT_STATE,
+  DEFAULT_VPN_STATUS,
   resolveProfileId,
   getProfile
 } = window.TZ_PROFILES_DATA;
@@ -14,6 +15,10 @@ const elProfileField = document.getElementById('profileField');
 const elExcludeSite = document.getElementById('toggleExcludeSite');
 const elSiteExcludeCard = document.getElementById('siteExcludeCard');
 const elSiteExcludeRow = document.getElementById('siteExcludeRow');
+const elAutoVpn = document.getElementById('toggleAutoVpn');
+const elAutoVpnRow = document.getElementById('autoVpnRow');
+const elVpnStatusHint = document.getElementById('vpnStatusHint');
+const elCheckVpnBtn = document.getElementById('checkVpnBtn');
 const elLang = document.getElementById('toggleLang');
 const elLangHint = document.getElementById('langHint');
 const elCdp = document.getElementById('toggleCdp');
@@ -29,9 +34,11 @@ const elDomainInput = document.getElementById('domainInput');
 const elReload = document.getElementById('reloadBtn');
 
 let currentState = Object.assign({}, DEFAULT_STATE);
+let currentVpnStatus = Object.assign({}, DEFAULT_VPN_STATUS);
 let activeTabId = null;
 let activeDomain = null;
 let pendingReload = false;
+let checkingVpn = false;
 
 function populateProfileSelect() {
   elProfile.textContent = '';
@@ -81,6 +88,47 @@ function getMatchedExcludedDomain() {
     }
   }
   return null;
+}
+
+function renderVpnStatus() {
+  elVpnStatusHint.classList.remove('hint-ok', 'hint-danger');
+  elAutoVpnRow.classList.remove('vpn-exposed');
+  elCheckVpnBtn.classList.toggle('spinning', checkingVpn);
+
+  if (checkingVpn) {
+    elVpnStatusHint.textContent = 'Проверяю выходной IP...';
+    return;
+  }
+
+  if (!currentState.autoVpn) {
+    elVpnStatusHint.textContent = 'Выкл · ручной выбор региона выше';
+    return;
+  }
+
+  if (currentVpnStatus.error) {
+    elVpnStatusHint.textContent = `Ошибка проверки IP (${currentVpnStatus.error})`;
+    return;
+  }
+
+  if (currentVpnStatus.exposed) {
+    elAutoVpnRow.classList.add('vpn-exposed');
+    elVpnStatusHint.classList.add('hint-danger');
+    const loc = currentVpnStatus.city
+      ? `${currentVpnStatus.countryCode || 'RU'} · ${currentVpnStatus.city}`
+      : (currentVpnStatus.countryCode || 'RU');
+    elVpnStatusHint.textContent = `⚠️ Виден IP ${loc} (VPN выключен?)`;
+    return;
+  }
+
+  if (currentVpnStatus.countryCode || currentVpnStatus.timezone) {
+    elVpnStatusHint.classList.add('hint-ok');
+    const parts = [currentVpnStatus.countryCode, currentVpnStatus.city].filter(Boolean).join(' · ');
+    const tzPart = currentVpnStatus.timezone ? ` (${currentVpnStatus.timezone})` : '';
+    elVpnStatusHint.textContent = `IP: ${parts || 'VPN'}${tzPart}`;
+    return;
+  }
+
+  elVpnStatusHint.textContent = 'Ожидание проверки IP...';
 }
 
 function updateClockAndSummary() {
@@ -159,17 +207,20 @@ function renderExcludedChips() {
 function renderUI() {
   const isEnabled = Boolean(currentState.enabled);
   const siteExcluded = isCurrentSiteExcluded();
+  const vpnExposed = isEnabled && Boolean(currentState.autoVpn) && Boolean(currentVpnStatus.exposed);
   const resolvedId = resolveProfileId(currentState.profileId);
   const profile = getProfile(resolvedId);
 
   elEnabled.checked = isEnabled;
   elMain.classList.toggle('disabled', !isEnabled);
   elDot.classList.toggle('off', !isEnabled);
+  elDot.classList.toggle('danger', vpnExposed && !siteExcluded);
   elDot.classList.toggle('bypass', isEnabled && siteExcluded);
   elProfileField.classList.toggle('dimmed', isEnabled && siteExcluded);
   elSiteExcludeCard.classList.toggle('active-bypass', isEnabled && siteExcluded);
 
   elProfile.value = resolvedId;
+  elAutoVpn.checked = Boolean(currentState.autoVpn);
   elLang.checked = Boolean(currentState.spoofLang);
   elLangHint.textContent = `Accept-Language, Intl и голоса (${profile.locale})`;
   elCdp.checked = Boolean(currentState.cdpMode);
@@ -196,6 +247,7 @@ function renderUI() {
     elReload.textContent = 'Обновить вкладку';
   }
 
+  renderVpnStatus();
   renderExcludedChips();
   updateClockAndSummary();
 }
@@ -207,6 +259,24 @@ async function saveState(patch) {
     pendingReload = true;
   }
   await chrome.storage.local.set(currentState);
+  renderUI();
+}
+
+async function requestManualVpnCheck() {
+  if (checkingVpn) return;
+  checkingVpn = true;
+  renderVpnStatus();
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'CHECK_VPN_NOW' });
+    if (res && res.vpnStatus) {
+      currentVpnStatus = Object.assign({}, DEFAULT_VPN_STATUS, res.vpnStatus);
+    }
+    if (res && res.switchedTo) {
+      currentState.profileId = resolveProfileId(res.switchedTo);
+      if (activeDomain) pendingReload = true;
+    }
+  } catch (_) {}
+  checkingVpn = false;
   renderUI();
 }
 
@@ -224,7 +294,11 @@ async function init() {
     } catch (_) {}
   }
 
-  const stored = await chrome.storage.local.get(DEFAULT_STATE);
+  const keysToRead = Object.assign({}, DEFAULT_STATE, { vpnStatus: DEFAULT_VPN_STATUS });
+  const stored = await chrome.storage.local.get(keysToRead);
+  currentVpnStatus = Object.assign({}, DEFAULT_VPN_STATUS, stored.vpnStatus || {});
+  delete stored.vpnStatus;
+
   currentState = Object.assign({}, DEFAULT_STATE, stored);
   currentState.profileId = resolveProfileId(currentState.profileId);
   if (!Array.isArray(currentState.excludedSites)) {
@@ -233,14 +307,53 @@ async function init() {
 
   renderUI();
   setInterval(updateClockAndSummary, 1000);
+
+  // Refresh VPN IP on popup open if autoVpn is enabled and last check was >20s ago
+  if (currentState.enabled && currentState.autoVpn && Date.now() - (currentVpnStatus.checkedAt || 0) > 20000) {
+    requestManualVpnCheck();
+  }
 }
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  if (changes.vpnStatus && changes.vpnStatus.newValue) {
+    currentVpnStatus = Object.assign({}, DEFAULT_VPN_STATUS, changes.vpnStatus.newValue);
+  }
+  if (changes.profileId && changes.profileId.newValue) {
+    const nextId = resolveProfileId(changes.profileId.newValue);
+    if (nextId !== currentState.profileId && activeDomain) {
+      pendingReload = true;
+    }
+    currentState.profileId = nextId;
+  }
+  if (changes.autoVpn !== undefined) {
+    currentState.autoVpn = Boolean(changes.autoVpn.newValue);
+  }
+  renderUI();
+});
 
 elEnabled.addEventListener('change', () => {
   saveState({ enabled: elEnabled.checked });
 });
 
 elProfile.addEventListener('change', () => {
-  saveState({ profileId: elProfile.value });
+  // Choosing a profile manually turns off autoVpn so background polling won't override manual choice
+  saveState({ profileId: elProfile.value, autoVpn: false });
+});
+
+elAutoVpn.addEventListener('change', async () => {
+  const enabledAuto = elAutoVpn.checked;
+  await saveState({ autoVpn: enabledAuto });
+  if (enabledAuto) {
+    requestManualVpnCheck();
+  }
+});
+
+elCheckVpnBtn.addEventListener('click', async () => {
+  if (!currentState.autoVpn) {
+    await saveState({ autoVpn: true });
+  }
+  requestManualVpnCheck();
 });
 
 elExcludeSite.addEventListener('change', () => {

@@ -14,7 +14,7 @@
         <div>
           <div class="title-row">
             <h1 class="title">Zone &amp; Locale</h1>
-            <span class="ver-badge">v1.4</span>
+            <span class="ver-badge">v1.5</span>
           </div>
           <p class="subtitle" id="liveClock">--:-- · UTC</p>
         </div>
@@ -51,6 +51,20 @@
 
       <!-- Minimalist Toggles -->
       <div class="toggles-group">
+        <div class="toggle-row toggle-row-static" id="autoVpnRow">
+          <label class="toggle-label-stretch" for="toggleAutoVpn">
+            <span class="toggle-title">Авто-выбор по IP (VPN)</span>
+            <span class="toggle-hint" id="vpnStatusHint">Следит за переключением VPN</span>
+          </label>
+          <div class="row-actions">
+            <button type="button" class="icon-btn" id="checkVpnBtn" title="Проверить IP и регион сейчас">↻</button>
+            <label class="switch switch-sm">
+              <input type="checkbox" id="toggleAutoVpn" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
         <label class="toggle-row">
           <div class="toggle-text">
             <span class="toggle-title">Английский язык браузера</span>

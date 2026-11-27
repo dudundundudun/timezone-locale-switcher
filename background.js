@@ -2,8 +2,17 @@
 
 importScripts('profiles-data.js');
 
-const { DEFAULT_STATE, resolveProfileId, getProfile } = self.TZ_PROFILES_DATA;
+const {
+  DEFAULT_STATE,
+  DEFAULT_VPN_STATUS,
+  resolveProfileId,
+  getProfile,
+  matchProfileFromGeo
+} = self.TZ_PROFILES_DATA;
+
 const DNR_RULE_ID = 1001;
+const VPN_WATCHDOG_ALARM = 'tz_vpn_watchdog';
+const SETTING_KEYS = ['enabled', 'profileId', 'autoVpn', 'spoofLang', 'cdpMode', 'excludedSites'];
 
 function normalizeDomain(host) {
   let s = String(host || '').trim().toLowerCase();
@@ -34,15 +43,18 @@ function isUrlExcluded(urlStr, excludedSites) {
 }
 
 async function getState() {
-  const data = await chrome.storage.local.get(DEFAULT_STATE);
+  const keysToRead = Object.assign({}, DEFAULT_STATE, { vpnStatus: DEFAULT_VPN_STATUS });
+  const data = await chrome.storage.local.get(keysToRead);
   const state = Object.assign({}, DEFAULT_STATE, data);
   state.profileId = resolveProfileId(state.profileId);
+  state.autoVpn = Boolean(state.autoVpn);
   if (!Array.isArray(state.excludedSites)) {
     state.excludedSites = [];
   }
   state.excludedSites = Array.from(
     new Set(state.excludedSites.map(normalizeDomain).filter(Boolean))
   );
+  state.vpnStatus = Object.assign({}, DEFAULT_VPN_STATUS, data.vpnStatus || {});
   return state;
 }
 
@@ -201,7 +213,6 @@ async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
         headers: { 'Accept-Language': profile.acceptLanguage }
       });
     } else {
-      // Clear previous locale/header overrides when language spoofing is turned off while CDP remains active
       await chrome.debugger.sendCommand(target, 'Emulation.setLocaleOverride', {
         locale: ''
       });
@@ -240,7 +251,7 @@ async function syncCdpMode(state) {
   }
 }
 
-// 4. Badge indicator (shows SYS when current tab is excluded)
+// 4. Badge indicator (shows SYS on excluded sites, red RU! on VPN drop, or active region code)
 async function syncBadge(state) {
   if (!state.enabled) {
     await chrome.action.setBadgeText({ text: 'OFF' });
@@ -257,9 +268,178 @@ async function syncBadge(state) {
     }
   } catch (_) {}
 
+  if (state.autoVpn && state.vpnStatus && state.vpnStatus.exposed) {
+    await chrome.action.setBadgeText({ text: 'RU!' });
+    await chrome.action.setBadgeBackgroundColor({ color: '#dc2626' });
+    return;
+  }
+
   const profile = getProfile(state.profileId);
   await chrome.action.setBadgeText({ text: profile.badge || 'ON' });
   await chrome.action.setBadgeBackgroundColor({ color: '#0284c7' });
+}
+
+// 5. Auto-VPN GeoIP Watchdog & Network-Change Detector
+const GEO_PROVIDERS = [
+  {
+    url: 'https://get.geojs.io/v1/ip/geo.json',
+    parse(d) {
+      if (!d || (!d.country_code && !d.timezone)) return null;
+      return {
+        ip: String(d.ip || ''),
+        countryCode: String(d.country_code || '').toUpperCase(),
+        city: String(d.city || d.region || ''),
+        timezone: String(d.timezone || '')
+      };
+    }
+  },
+  {
+    url: 'https://ipwho.is/?output=json',
+    parse(d) {
+      if (!d || d.success === false) return null;
+      const tz = d.timezone && typeof d.timezone === 'object' ? d.timezone.id : d.timezone;
+      if (!d.country_code && !tz) return null;
+      return {
+        ip: String(d.ip || ''),
+        countryCode: String(d.country_code || '').toUpperCase(),
+        city: String(d.city || d.region || ''),
+        timezone: String(tz || '')
+      };
+    }
+  },
+  {
+    url: 'https://api.ip.sb/geoip',
+    parse(d) {
+      if (!d || (!d.country_code && !d.timezone)) return null;
+      return {
+        ip: String(d.ip || ''),
+        countryCode: String(d.country_code || '').toUpperCase(),
+        city: String(d.city || d.region || ''),
+        timezone: String(d.timezone || '')
+      };
+    }
+  }
+];
+
+async function fetchJsonNoStore(url, timeoutMs = 4500) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      cache: 'no-store',
+      credentials: 'omit',
+      headers: { Accept: 'application/json' },
+      signal: ctrl.signal
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchGeoIpInfo() {
+  for (const provider of GEO_PROVIDERS) {
+    const raw = await fetchJsonNoStore(provider.url);
+    const parsed = raw ? provider.parse(raw) : null;
+    if (parsed && (parsed.countryCode || parsed.timezone)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+let inFlightVpnCheck = null;
+
+async function checkVpnLocation(force = false) {
+  if (inFlightVpnCheck) return inFlightVpnCheck;
+
+  inFlightVpnCheck = (async () => {
+    try {
+      const initialState = await getState();
+      if (!force && (!initialState.enabled || !initialState.autoVpn)) {
+        return { ok: false, skipped: true };
+      }
+
+      const geo = await fetchGeoIpInfo();
+      const latestState = await getState();
+
+      if (!geo) {
+        const errStatus = Object.assign({}, latestState.vpnStatus, {
+          checkedAt: Date.now(),
+          error: 'Нет ответа от GeoIP'
+        });
+        await chrome.storage.local.set({ vpnStatus: errStatus });
+        return { ok: false, vpnStatus: errStatus };
+      }
+
+      const match = matchProfileFromGeo(geo.countryCode, geo.timezone);
+      const nextVpnStatus = {
+        ip: geo.ip,
+        countryCode: geo.countryCode,
+        city: geo.city,
+        timezone: geo.timezone,
+        matchedProfileId: match.profileId || '',
+        exposed: Boolean(match.exposed),
+        checkedAt: Date.now(),
+        error: ''
+      };
+
+      const patch = { vpnStatus: nextVpnStatus };
+      let switchedTo = null;
+
+      if (
+        latestState.enabled &&
+        latestState.autoVpn &&
+        !match.exposed &&
+        match.profileId &&
+        match.profileId !== latestState.profileId
+      ) {
+        patch.profileId = match.profileId;
+        switchedTo = match.profileId;
+      }
+
+      await chrome.storage.local.set(patch);
+      return { ok: true, vpnStatus: nextVpnStatus, switchedTo };
+    } finally {
+      inFlightVpnCheck = null;
+    }
+  })();
+
+  return inFlightVpnCheck;
+}
+
+let netDebounceFast = null;
+let netDebounceVerify = null;
+
+function onNetworkChanged() {
+  if (netDebounceFast) clearTimeout(netDebounceFast);
+  if (netDebounceVerify) clearTimeout(netDebounceVerify);
+
+  // Fast probe once VPN route settles (~900ms), plus verification probe (~3.8s) for Hysteria2/LTE handshakes
+  netDebounceFast = setTimeout(() => {
+    checkVpnLocation(false).catch(() => {});
+  }, 900);
+  netDebounceVerify = setTimeout(() => {
+    checkVpnLocation(false).catch(() => {});
+  }, 3800);
+}
+
+async function syncVpnWatchdogAlarm(state) {
+  if (!chrome.alarms) return;
+  try {
+    if (state.enabled && state.autoVpn) {
+      const existing = await chrome.alarms.get(VPN_WATCHDOG_ALARM);
+      if (!existing) {
+        chrome.alarms.create(VPN_WATCHDOG_ALARM, { periodInMinutes: 2 });
+      }
+    } else {
+      await chrome.alarms.clear(VPN_WATCHDOG_ALARM);
+    }
+  } catch (_) {}
 }
 
 // Serialized sync queue prevents race conditions ("Duplicate script ID") on rapid toggle clicks
@@ -272,7 +452,8 @@ async function applyAllSettingsNow() {
     syncNetworkHeaders(state),
     syncContentScripts(state),
     syncCdpMode(state),
-    syncBadge(state)
+    syncBadge(state),
+    syncVpnWatchdogAlarm(state)
   ]);
 }
 
@@ -291,27 +472,64 @@ function scheduleApplyAllSettings() {
   return syncChain;
 }
 
+if (self.navigator && self.navigator.connection && typeof self.navigator.connection.addEventListener === 'function') {
+  self.navigator.connection.addEventListener('change', onNetworkChanged);
+}
+self.addEventListener('online', onNetworkChanged);
+
+if (chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === VPN_WATCHDOG_ALARM) {
+      checkVpnLocation(false).catch(() => {});
+    }
+  });
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === 'CHECK_VPN_NOW') {
+    checkVpnLocation(true)
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+  return false;
+});
+
 chrome.runtime.onInstalled.addListener(async () => {
   const current = await chrome.storage.local.get(null);
   const patch = {};
   if (current.enabled === undefined) {
     Object.assign(patch, DEFAULT_STATE);
-  } else if (current.profileId && resolveProfileId(current.profileId) !== current.profileId) {
-    patch.profileId = resolveProfileId(current.profileId);
+  } else {
+    if (current.profileId && resolveProfileId(current.profileId) !== current.profileId) {
+      patch.profileId = resolveProfileId(current.profileId);
+    }
+    if (current.autoVpn === undefined) {
+      patch.autoVpn = true;
+    }
   }
   if (Object.keys(patch).length > 0) {
     await chrome.storage.local.set(patch);
   }
   await scheduleApplyAllSettings();
+  checkVpnLocation(false).catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
   scheduleApplyAllSettings();
+  checkVpnLocation(false).catch(() => {});
 });
 
-chrome.storage.onChanged.addListener((_changes, areaName) => {
-  if (areaName === 'local') {
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  const settingsChanged = SETTING_KEYS.some((k) => k in changes);
+  if (settingsChanged) {
     scheduleApplyAllSettings();
+    if ('autoVpn' in changes && changes.autoVpn.newValue === true) {
+      checkVpnLocation(false).catch(() => {});
+    }
+  } else if ('vpnStatus' in changes) {
+    getState().then(syncBadge).catch(() => {});
   }
 });
 

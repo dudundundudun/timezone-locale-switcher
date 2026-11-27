@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Zone & Locale Switcher",
-  "version": "1.4.0",
-  "description": "Minimalist timezone, browser language, and system speech voices switcher tailored for VPN locations with per-site exclusions and optional CDP mode.",
+  "version": "1.5.0",
+  "description": "Minimalist timezone, browser language, and system speech voices switcher with Auto-VPN IP sync, RU leak alert, per-site exclusions, and optional CDP mode.",
   "permissions": [
     "storage",
     "scripting",
     "declarativeNetRequest",
     "tabs",
-    "debugger"
+    "debugger",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"

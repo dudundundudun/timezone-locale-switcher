@@ -5,7 +5,7 @@
 }
 
 body {
-  width: 332px;
+  width: 336px;
   background: #0f1218;
   color: #e2e8f0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
@@ -49,6 +49,11 @@ body {
 .status-dot.bypass {
   background: #f59e0b;
   box-shadow: 0 0 8px rgba(245, 158, 11, 0.45);
+}
+
+.status-dot.danger {
+  background: #ef4444;
+  box-shadow: 0 0 9px rgba(239, 68, 68, 0.65);
 }
 
 .status-dot.off {
@@ -205,6 +210,7 @@ select:focus {
   border-radius: 10px;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .toggle-row {
@@ -216,8 +222,59 @@ select:focus {
   gap: 10px;
 }
 
+.toggle-row-static {
+  cursor: default;
+}
+
+.toggle-row.vpn-exposed {
+  background: rgba(220, 38, 38, 0.11);
+}
+
 .toggle-row + .toggle-row {
   border-top: 1px solid #1e2532;
+}
+
+.toggle-label-stretch {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+.icon-btn {
+  background: #1a2230;
+  border: 1px solid #2a3548;
+  color: #94a3b8;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.icon-btn:hover {
+  color: #f1f5f9;
+  border-color: #475569;
+  background: #243044;
+}
+
+.icon-btn.spinning {
+  color: #38bdf8;
+  border-color: #38bdf8;
 }
 
 .toggle-text {
@@ -235,10 +292,19 @@ select:focus {
 .toggle-hint {
   font-size: 11px;
   color: #64748b;
-  max-width: 222px;
+  max-width: 210px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.toggle-hint.hint-ok {
+  color: #38bdf8;
+}
+
+.toggle-hint.hint-danger {
+  color: #f87171;
+  font-weight: 500;
 }
 
 /* Minimalist Switch */
