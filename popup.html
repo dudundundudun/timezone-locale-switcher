@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Zone & Locale</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="card">
+    <!-- Top Header & Master Switch -->
+    <header class="header">
+      <div class="brand">
+        <span class="status-dot" id="statusDot"></span>
+        <div>
+          <div class="title-row">
+            <h1 class="title">Zone &amp; Locale</h1>
+            <span class="ver-badge">v1.3</span>
+          </div>
+          <p class="subtitle" id="liveClock">--:-- · UTC</p>
+        </div>
+      </div>
+      <label class="switch" title="Включить / выключить расширение">
+        <input type="checkbox" id="toggleEnabled" checked>
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <!-- Main Body -->
+    <main class="main" id="mainControls">
+      <!-- Dedicated Site Bypass Card (ALWAYS visible) -->
+      <div class="site-card" id="siteExcludeCard">
+        <label class="site-row" id="siteExcludeRow">
+          <div class="toggle-text">
+            <span class="toggle-title">Не подменять на этом сайте</span>
+            <span class="toggle-hint" id="currentDomainHint">Активная вкладка</span>
+          </div>
+          <span class="switch switch-sm switch-warn">
+            <input type="checkbox" id="toggleExcludeSite">
+            <span class="slider"></span>
+          </span>
+        </label>
+      </div>
+
+      <!-- Profile Dropdown -->
+      <div class="field" id="profileField">
+        <label class="field-label" for="profileSelect">Активный профиль</label>
+        <div class="select-wrap">
+          <select id="profileSelect">
+            <option value="us_east">🇺🇸 US East — Atlanta / Ashburn</option>
+            <option value="us_mountain">🇺🇸 US Mountain — Denver</option>
+            <option value="us_central">🇺🇸 US Central — Chicago / Dallas</option>
+            <option value="us_west">🇺🇸 US West — Los Angeles / Seattle</option>
+            <option value="uk_london">🇬🇧 UK — London</option>
+            <option value="eu_central">🇪🇺 Europe — Frankfurt / Amsterdam</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Minimalist Toggles -->
+      <div class="toggles-group">
+        <label class="toggle-row">
+          <div class="toggle-text">
+            <span class="toggle-title">Английский язык браузера</span>
+            <span class="toggle-hint">Accept-Language, Intl и голоса (en-US)</span>
+          </div>
+          <span class="switch switch-sm">
+            <input type="checkbox" id="toggleLang" checked>
+            <span class="slider"></span>
+          </span>
+        </label>
+
+        <label class="toggle-row">
+          <div class="toggle-text">
+            <span class="toggle-title">Глубокая эмуляция (CDP)</span>
+            <span class="toggle-hint">Уровень движка Chrome и Web Workers</span>
+          </div>
+          <span class="switch switch-sm">
+            <input type="checkbox" id="toggleCdp">
+            <span class="slider"></span>
+          </span>
+        </label>
+      </div>
+
+      <!-- Excluded Domains Input & Chips -->
+      <div class="excluded-box">
+        <label class="field-label" id="excludedCountLabel" for="domainInput">Исключённые сайты (без подмены)</label>
+        <form class="add-domain-form" id="addDomainForm">
+          <input type="text" id="domainInput" placeholder="Добавить домен, напр. ya.ru" autocomplete="off" spellcheck="false">
+          <button type="submit" class="add-btn" title="Добавить в исключения">+</button>
+        </form>
+        <div class="chips" id="excludedChips"></div>
+      </div>
+    </main>
+
+    <!-- Quiet Status Footer -->
+    <footer class="footer">
+      <span id="tzSummary">America/New_York · en-US</span>
+      <button type="button" class="reload-btn" id="reloadBtn" title="Обновить текущую вкладку">Обновить вкладку</button>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
