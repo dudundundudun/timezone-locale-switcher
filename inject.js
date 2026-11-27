@@ -12,6 +12,22 @@
 
   if (!initialCfg || !initialCfg.tz) return;
 
+  // Abort immediately inside cross-origin subframes (e.g. challenges.cloudflare.com) when the top-level tab
+  // is in `excludedSites` ("Не подменять на этом сайте"), signaled by DNR session rule Server-Timing `tz_bypass`.
+  try {
+    if (root.top && root !== root.top && root.performance && typeof root.performance.getEntriesByType === 'function') {
+      const navEntries = root.performance.getEntriesByType('navigation');
+      const nav = navEntries && navEntries[0];
+      if (nav && nav.serverTiming && nav.serverTiming.length > 0) {
+        for (let i = 0; i < nav.serverTiming.length; i++) {
+          if (nav.serverTiming[i] && nav.serverTiming[i].name === 'tz_bypass') {
+            return;
+          }
+        }
+      }
+    }
+  } catch (_) {}
+
   // Self-contained installer function so we can also serialize & bootstrap inside Dedicated/Shared Web Workers
   function installEnv(cfg) {
     'use strict';
@@ -25,8 +41,9 @@
       ? cfg.languages.slice()
       : ['en-US', 'en'];
     const SPOOF_LANG = Boolean(cfg.spoofLang);
+    const REALM_BRIDGE_TOKEN = '__tz_rb_4f9e2c71a805d3b6e1947c2a__';
 
-    // Detect our own V8 script identifier in Error.stack (works for chrome-extension://, blob:, or <anonymous>:)
+    // Save untouched root intrinsics BEFORE patching (and check if a same-origin parent/top/opener already installed shared state)
     const RootError = envRoot.Error;
     let SELF_STACK_MARKER = 'inject.js';
     try {
@@ -40,7 +57,27 @@
       }
     } catch (_) {}
 
-    // Save untouched root intrinsics BEFORE patching
+    // Coordinate across same-origin frames (about:blank, srcdoc, subframes, popups) without adding any own property to Window:
+    // prevents double-patching when Chrome's `allFrames: true` content script runs after synchronous parent DOM hooks,
+    // and shares a single WeakMap/Blob registry across all same-origin realms.
+    for (const rel of ['top', 'parent', 'opener']) {
+      try {
+        const relWin = envRoot[rel];
+        if (relWin && relWin !== envRoot) {
+          const relFnProto = (relWin.Function && relWin.Function.prototype) ||
+            (typeof relWin.Date === 'function' ? Object.getPrototypeOf(relWin.Date) : null) ||
+            (typeof relWin.setTimeout === 'function' ? Object.getPrototypeOf(relWin.setTimeout) : null);
+          if (relFnProto && typeof relFnProto.toString === 'function') {
+            const shared = relFnProto.toString.call(REALM_BRIDGE_TOKEN);
+            if (shared && typeof shared.patchRealm === 'function') {
+              shared.patchRealm(envRoot);
+              return;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
     const RootDate = envRoot.Date;
     const RootDateUTC = RootDate.UTC;
     const RootDateNow = RootDate.now;
@@ -65,10 +102,26 @@
     const reflectConstruct = Reflect.construct;
     const reflectGetProto = Reflect.getPrototypeOf;
     const reflectSetProto = Reflect.setPrototypeOf;
+    const origBlobSizeGet = envRoot.Blob && envRoot.Blob.prototype
+      ? getOwnPropDesc(envRoot.Blob.prototype, 'size')?.get
+      : null;
 
     const nativeSourceMap = new WeakMap();
     const patchedRealms = new WeakSet();
     const trackedBlobs = new Map();
+    const blobSizeGetters = new Set();
+    if (origBlobSizeGet) blobSizeGetters.add(origBlobSizeGet);
+
+    function isGenuineBlob(v) {
+      if (!v || typeof v !== 'object') return false;
+      for (const getter of blobSizeGetters) {
+        try {
+          getter.call(v);
+          return true;
+        } catch (_) {}
+      }
+      return Boolean(envRoot.Blob && v instanceof envRoot.Blob);
+    }
 
     const markNative = (fn, label) => {
       if (typeof fn === 'function') {
@@ -84,25 +137,35 @@
       return false;
     }
 
-    function cleanErrorStack(err, RealmObject) {
+    function cleanErrorStack(err, RealmObject, RealmError) {
       try {
-        if (err && (typeof err === 'object' || typeof err === 'function') && typeof err.stack === 'string') {
-          const lines = err.stack.split('\n');
-          const filtered = [];
-          for (let i = 0; i < lines.length; i++) {
-            const ln = lines[i];
-            if (i > 0 && isOwnWrapperFrame(ln)) {
-              continue;
-            }
-            filtered.push(ln);
+        if (!err || (typeof err !== 'object' && typeof err !== 'function')) return err;
+        if (RealmError && typeof RealmError.prepareStackTrace === 'function') return err;
+        const getDesc = RealmObject ? RealmObject.getOwnPropertyDescriptor : getOwnPropDesc;
+        const desc = getDesc(err, 'stack');
+        if (!desc || !desc.configurable) return err;
+        const rawStack = err.stack;
+        if (typeof rawStack !== 'string') return err;
+        const lines = rawStack.split('\n');
+        const filtered = [];
+        for (let i = 0; i < lines.length; i++) {
+          const ln = lines[i];
+          if (i > 0 && isOwnWrapperFrame(ln)) {
+            continue;
           }
-          if (filtered.length !== lines.length) {
+          filtered.push(ln);
+        }
+        if (filtered.length !== lines.length) {
+          const cleaned = filtered.join('\n');
+          if ('value' in desc) {
             (RealmObject ? RealmObject.defineProperty : defineProp)(err, 'stack', {
-              value: filtered.join('\n'),
-              writable: true,
-              enumerable: false,
+              value: cleaned,
+              writable: Boolean(desc.writable),
+              enumerable: Boolean(desc.enumerable),
               configurable: true
             });
+          } else if (typeof desc.set === 'function') {
+            desc.set.call(err, cleaned);
           }
         }
       } catch (_) {}
@@ -110,7 +173,7 @@
     }
 
     // Concise methods & getters: NO .prototype, non-constructible, exact .length & .name
-    function makeMethod(name, arity, impl, RealmObject) {
+    function makeMethod(name, arity, impl, RealmObject, RealmError) {
       let fn;
       switch (arity) {
         case 1:
@@ -119,7 +182,7 @@
               try {
                 return reflectApply(impl, this, arguments);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
           })[name];
@@ -130,7 +193,7 @@
               try {
                 return reflectApply(impl, this, arguments);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
           })[name];
@@ -141,7 +204,7 @@
               try {
                 return reflectApply(impl, this, arguments);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
           })[name];
@@ -152,7 +215,7 @@
               try {
                 return reflectApply(impl, this, arguments);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
           })[name];
@@ -163,7 +226,7 @@
               try {
                 return reflectApply(impl, this, arguments);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
           })[name];
@@ -172,13 +235,13 @@
       return markNative(fn, name);
     }
 
-    function makeGetter(propName, impl, RealmObject) {
+    function makeGetter(propName, impl, RealmObject, RealmError) {
       const holder = {
         get [propName]() {
           try {
             return reflectApply(impl, this, []);
           } catch (e) {
-            throw cleanErrorStack(e, RealmObject);
+            throw cleanErrorStack(e, RealmObject, RealmError);
           }
         }
       };
@@ -186,13 +249,13 @@
       return markNative(getter, `get ${propName}`);
     }
 
-    function makeSetter(propName, impl, RealmObject) {
+    function makeSetter(propName, impl, RealmObject, RealmError) {
       const holder = {
         set [propName](v) {
           try {
             return reflectApply(impl, this, [v]);
           } catch (e) {
-            throw cleanErrorStack(e, RealmObject);
+            throw cleanErrorStack(e, RealmObject, RealmError);
           }
         }
       };
@@ -202,7 +265,7 @@
 
     // Proxy wrapper immune to V8 cyclic __proto__ Proxy detection
     // (Object.setPrototypeOf(Ctor, Ctor), Ctor.__proto__ = Ctor, Reflect.setPrototypeOf(Ctor, Object.create(Ctor)))
-    function makeSafeProxy(TargetCtor, label, traps, RealmObject) {
+    function makeSafeProxy(TargetCtor, label, traps, RealmObject, RealmError) {
       let proxyRef;
       const fullTraps = Object.assign(
         {
@@ -210,14 +273,28 @@
             let cur = v;
             while (cur !== null && (typeof cur === 'object' || typeof cur === 'function')) {
               if (cur === proxyRef || cur === target) {
-                const st = String(new RootError().stack || '');
+                const prevLim = RootError.stackTraceLimit;
+                let st = '';
+                try {
+                  if (typeof prevLim === 'number' && prevLim < 10) {
+                    RootError.stackTraceLimit = 10;
+                  }
+                  st = String(new RootError().stack || '');
+                } catch (_) {
+                } finally {
+                  try {
+                    if (typeof prevLim === 'number' && prevLim < 10) {
+                      RootError.stackTraceLimit = prevLim;
+                    }
+                  } catch (_) {}
+                }
                 if (st.includes('Reflect.setPrototypeOf')) {
                   return false;
                 }
                 try {
                   RealmObject.setPrototypeOf(target, target);
                 } catch (e) {
-                  throw cleanErrorStack(e, RealmObject);
+                  throw cleanErrorStack(e, RealmObject, RealmError);
                 }
               }
               cur = reflectGetProto(cur);
@@ -262,8 +339,31 @@
       return RootDateUTC(yr, +month, +day, +hour, +minute, +second, +ms);
     }
 
+    // Cache last resolved UTC minute bucket so tight Date loops run at native speed without ICU allocations
+    let cachedMinuteKey = NaN;
+    let cachedMinuteBase = null;
+
     function getTargetParts(epochMs) {
       if (Number.isNaN(epochMs) || !Number.isFinite(epochMs)) return null;
+      const minuteKey = Math.floor(epochMs / 60000);
+      if (minuteKey === cachedMinuteKey && cachedMinuteBase !== null) {
+        const remMs = epochMs - minuteKey * 60000;
+        const sec = Math.floor(remMs / 1000);
+        const ms = remMs - sec * 1000;
+        return {
+          year: cachedMinuteBase.year,
+          month: cachedMinuteBase.month,
+          day: cachedMinuteBase.day,
+          hour: cachedMinuteBase.hour,
+          minute: cachedMinuteBase.minute,
+          second: sec,
+          ms,
+          weekday: cachedMinuteBase.weekday,
+          weekdayStr: cachedMinuteBase.weekdayStr,
+          offsetSec: cachedMinuteBase.offsetSec,
+          offsetMin: cachedMinuteBase.offsetMin
+        };
+      }
       const d = new RootDate(epochMs);
       const parts = partsFmt.formatToParts(d);
       let year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0, weekdayStr = 'Sun';
@@ -289,6 +389,23 @@
       const asUtcMs = fullYearUtcMs(year, month, day, hour, minute, second, ms);
       const offsetSec = Math.round((epochMs - asUtcMs) / 1000);
       const offsetMin = Math.trunc(offsetSec / 60);
+      const normalizedOffsetMin = offsetMin === 0 ? 0 : offsetMin;
+      const weekday = WEEKDAYS[weekdayStr] ?? 0;
+      // Only cache standard whole-minute offset zones (non-LMT historical seconds)
+      if (offsetSec % 60 === 0 && year >= 1900) {
+        cachedMinuteKey = minuteKey;
+        cachedMinuteBase = {
+          year,
+          month,
+          day,
+          hour,
+          minute,
+          weekday,
+          weekdayStr,
+          offsetSec,
+          offsetMin: normalizedOffsetMin
+        };
+      }
       return {
         year,
         month,
@@ -297,10 +414,10 @@
         minute,
         second,
         ms,
-        weekday: WEEKDAYS[weekdayStr] ?? 0,
+        weekday,
         weekdayStr,
         offsetSec,
-        offsetMin: offsetMin === 0 ? 0 : offsetMin
+        offsetMin: normalizedOffsetMin
       };
     }
 
@@ -461,10 +578,11 @@
       });
     }
 
-    function resolveLocaleArg(locales) {
+    function resolveLocaleArg(locales, realmGetCanonicalLocales) {
       if (!SPOOF_LANG) return locales;
       if (locales === undefined) return TARGET_LOCALE;
-      const canon = RootGetCanonicalLocales(locales);
+      const canonicalize = realmGetCanonicalLocales || RootGetCanonicalLocales;
+      const canon = canonicalize(locales);
       return canon.length === 0 ? TARGET_LOCALE : canon;
     }
 
@@ -486,7 +604,7 @@
       spoofLang: SPOOF_LANG
     })});\n`;
 
-    function patchNavigatorProto(NavProto, realmLanguages, RealmObject) {
+    function patchNavigatorProto(NavProto, realmLanguages, RealmObject, RealmError) {
       if (!NavProto) return;
       const realmDefine = RealmObject.defineProperty;
       const realmGetOwnDesc = RealmObject.getOwnPropertyDescriptor;
@@ -498,7 +616,7 @@
           // C++ Blink WebIDL brand check: throws genuine `TypeError: Illegal invocation` on Navigator.prototype or fake objects!
           origLangGet.call(this);
           return TARGET_LOCALE;
-        }, RealmObject);
+        }, RealmObject, RealmError);
         realmDefine(NavProto, 'language', {
           get: getLang,
           set: undefined,
@@ -513,7 +631,7 @@
         const getLangs = makeGetter('languages', function () {
           origLangsGet.call(this);
           return realmLanguages;
-        }, RealmObject);
+        }, RealmObject, RealmError);
         realmDefine(NavProto, 'languages', {
           get: getLangs,
           set: undefined,
@@ -523,17 +641,22 @@
       }
     }
 
+    const sharedBridge = { patchRealm };
+
     function patchRealm(win) {
       if (!win || (typeof win !== 'object' && typeof win !== 'function')) return;
       if (patchedRealms.has(win)) return;
 
-      let OrigDate, OrigIntl, OrigFnProto, RealmObject, RealmTypeError;
+      let OrigDate, OrigIntl, OrigFnProto, RealmObject, RealmError, RealmTypeError, RealmNumber;
       try {
         OrigDate = win.Date;
         OrigIntl = win.Intl;
-        OrigFnProto = win.Function && win.Function.prototype;
-        RealmObject = win.Object || Object;
+        OrigFnProto = (win.Function && win.Function.prototype) ||
+          (typeof OrigDate === 'function' ? reflectGetProto(OrigDate) : null);
+        RealmObject = win.Object || (OrigIntl ? reflectGetProto(OrigIntl).constructor : Object);
+        RealmError = win.Error || RootError;
         RealmTypeError = win.TypeError || TypeError;
+        RealmNumber = win.Number || Number;
         if (typeof OrigDate !== 'function' || !OrigIntl || !OrigFnProto) return;
       } catch (_) {
         return;
@@ -543,15 +666,21 @@
 
       const realmDefine = RealmObject.defineProperty;
       const realmGetOwnDesc = RealmObject.getOwnPropertyDescriptor;
+      const realmGetCanonicalLocales = typeof OrigIntl.getCanonicalLocales === 'function'
+        ? OrigIntl.getCanonicalLocales
+        : RootGetCanonicalLocales;
 
-      // 1. Function.prototype.toString
+      // 1. Function.prototype.toString (also serves as capability-gated same-origin realm bridge)
       const OrigFnToString = OrigFnProto.toString;
       const patchedFnToString = makeMethod('toString', 0, function () {
+        if (this === REALM_BRIDGE_TOKEN) {
+          return sharedBridge;
+        }
         if (typeof this === 'function' && nativeSourceMap.has(this)) {
           return nativeSourceMap.get(this);
         }
         return reflectApply(OrigFnToString, this, []);
-      }, RealmObject);
+      }, RealmObject, RealmError);
 
       realmDefine(OrigFnProto, 'toString', {
         value: patchedFnToString,
@@ -588,9 +717,10 @@
       const origSetFullYear = proto.setFullYear;
       const origSetYear = proto.setYear;
 
+      const origDateParse = OrigDate.parse;
       const patchProtoMethod = (targetProto, name, arity, impl) => {
         if (!targetProto) return;
-        const fn = makeMethod(name, arity, impl, RealmObject);
+        const fn = makeMethod(name, arity, impl, RealmObject, RealmError);
         realmDefine(targetProto, name, {
           value: fn,
           writable: true,
@@ -671,15 +801,15 @@
 
       patchProtoMethod(proto, 'toLocaleString', 0, function (locales, options) {
         if (!isDateObj(this)) return origToLocaleString.call(this, locales, options);
-        return origToLocaleString.call(this, resolveLocaleArg(locales), withTzOptions(options));
+        return origToLocaleString.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), withTzOptions(options));
       });
       patchProtoMethod(proto, 'toLocaleDateString', 0, function (locales, options) {
         if (!isDateObj(this)) return origToLocaleDateString.call(this, locales, options);
-        return origToLocaleDateString.call(this, resolveLocaleArg(locales), withTzOptions(options));
+        return origToLocaleDateString.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), withTzOptions(options));
       });
       patchProtoMethod(proto, 'toLocaleTimeString', 0, function (locales, options) {
         if (!isDateObj(this)) return origToLocaleTimeString.call(this, locales, options);
-        return origToLocaleTimeString.call(this, resolveLocaleArg(locales), withTzOptions(options));
+        return origToLocaleTimeString.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), withTzOptions(options));
       });
 
       patchProtoMethod(proto, 'setHours', 4, function (h, m, s, ms) {
@@ -792,22 +922,31 @@
               return reflectConstruct(target, [prim], newTarget);
             }
             const [y, mo, d = 1, h = 0, mn = 0, s = 0, ms = 0] = args;
-            let fullY = +y;
+            let fullY = RealmNumber(y);
+            const numMo = RealmNumber(mo);
+            const numD = args.length > 2 ? RealmNumber(d) : 1;
+            const numH = args.length > 3 ? RealmNumber(h) : 0;
+            const numMn = args.length > 4 ? RealmNumber(mn) : 0;
+            const numS = args.length > 5 ? RealmNumber(s) : 0;
+            const numMs = args.length > 6 ? RealmNumber(ms) : 0;
             if (!Number.isNaN(fullY)) {
               const truncY = Math.trunc(fullY);
               if (truncY >= 0 && truncY <= 99) fullY = 1900 + truncY;
             }
-            const epoch = localComponentsToEpoch(fullY, mo, d, h, mn, s, ms);
+            const epoch = localComponentsToEpoch(fullY, numMo, numD, numH, numMn, numS, numMs);
             return reflectConstruct(target, [epoch], newTarget);
           } catch (e) {
-            throw cleanErrorStack(e, RealmObject);
+            throw cleanErrorStack(e, RealmObject, RealmError);
           }
         }
-      }, RealmObject);
+      }, RealmObject, RealmError);
 
       const parseMethod = makeMethod('parse', 1, function (str) {
+        if (typeof str === 'symbol') {
+          return origDateParse(str);
+        }
         return parseInTargetTz(String(str));
-      }, RealmObject);
+      }, RealmObject, RealmError);
       realmDefine(DateProxy, 'parse', { value: parseMethod, writable: true, enumerable: false, configurable: true });
       realmDefine(proto, 'constructor', { value: DateProxy, writable: true, enumerable: false, configurable: true });
       realmDefine(win, 'Date', { value: DateProxy, writable: true, enumerable: false, configurable: true });
@@ -818,20 +957,20 @@
         apply(target, thisArg, args) {
           try {
             const [locales, options] = args;
-            return reflectApply(target, thisArg, [resolveLocaleArg(locales), withTzOptions(options)]);
+            return reflectApply(target, thisArg, [resolveLocaleArg(locales, realmGetCanonicalLocales), withTzOptions(options)]);
           } catch (e) {
-            throw cleanErrorStack(e, RealmObject);
+            throw cleanErrorStack(e, RealmObject, RealmError);
           }
         },
         construct(target, args, newTarget) {
           try {
             const [locales, options] = args;
-            return reflectConstruct(target, [resolveLocaleArg(locales), withTzOptions(options)], newTarget);
+            return reflectConstruct(target, [resolveLocaleArg(locales, realmGetCanonicalLocales), withTzOptions(options)], newTarget);
           } catch (e) {
-            throw cleanErrorStack(e, RealmObject);
+            throw cleanErrorStack(e, RealmObject, RealmError);
           }
         }
-      }, RealmObject);
+      }, RealmObject, RealmError);
       realmDefine(OrigDTF.prototype, 'constructor', { value: DTFProxy, writable: true, enumerable: false, configurable: true });
       realmDefine(OrigIntl, 'DateTimeFormat', { value: DTFProxy, writable: true, enumerable: false, configurable: true });
 
@@ -842,7 +981,7 @@
         if (typeof tNow.timeZoneId === 'function') {
           const tzIdFn = makeMethod('timeZoneId', 0, function () {
             return TARGET_TZ;
-          }, RealmObject);
+          }, RealmObject, RealmError);
           realmDefine(tNow, 'timeZoneId', { value: tzIdFn, writable: true, enumerable: false, configurable: true });
         }
 
@@ -852,7 +991,7 @@
             const wrapped = makeMethod(methodName, 0, function () {
               const tzArg = arguments[0] === undefined ? TARGET_TZ : arguments[0];
               return origMethod.call(this, tzArg);
-            }, RealmObject);
+            }, RealmObject, RealmError);
             realmDefine(tNow, methodName, { value: wrapped, writable: true, enumerable: false, configurable: true });
           }
         }
@@ -860,7 +999,7 @@
         if (RealmTemporal.Instant && RealmTemporal.Instant.prototype && typeof RealmTemporal.Instant.prototype.toLocaleString === 'function') {
           const origInstTls = RealmTemporal.Instant.prototype.toLocaleString;
           patchProtoMethod(RealmTemporal.Instant.prototype, 'toLocaleString', 0, function (locales, options) {
-            return origInstTls.call(this, resolveLocaleArg(locales), withTzOptions(options));
+            return origInstTls.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), withTzOptions(options));
           });
         }
       }
@@ -878,20 +1017,20 @@
                 // Calling reflectApply preserves legacy chaining on NumberFormat/Collator AND throws genuine
                 // `TypeError: Constructor Intl.PluralRules requires 'new'` on modern Intl constructors!
                 const [locales, options] = args;
-                return reflectApply(target, thisArg, [resolveLocaleArg(locales), options]);
+                return reflectApply(target, thisArg, [resolveLocaleArg(locales, realmGetCanonicalLocales), options]);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             },
             construct(target, args, newTarget) {
               try {
                 const [locales, options] = args;
-                return reflectConstruct(target, [resolveLocaleArg(locales), options], newTarget);
+                return reflectConstruct(target, [resolveLocaleArg(locales, realmGetCanonicalLocales), options], newTarget);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
-          }, RealmObject);
+          }, RealmObject, RealmError);
           if (OrigCtor.prototype) {
             realmDefine(OrigCtor.prototype, 'constructor', { value: p, writable: true, enumerable: false, configurable: true });
           }
@@ -914,14 +1053,14 @@
         if (win.Number && win.Number.prototype && typeof win.Number.prototype.toLocaleString === 'function') {
           const origNumTls = win.Number.prototype.toLocaleString;
           patchProtoMethod(win.Number.prototype, 'toLocaleString', 0, function (locales, options) {
-            return origNumTls.call(this, resolveLocaleArg(locales), options);
+            return origNumTls.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), options);
           });
         }
 
         if (win.BigInt && win.BigInt.prototype && typeof win.BigInt.prototype.toLocaleString === 'function') {
           const origBigTls = win.BigInt.prototype.toLocaleString;
           patchProtoMethod(win.BigInt.prototype, 'toLocaleString', 0, function (locales, options) {
-            return origBigTls.call(this, resolveLocaleArg(locales), options);
+            return origBigTls.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), options);
           });
         }
 
@@ -931,7 +1070,7 @@
             if (this === null || this === undefined) {
               return origLocaleCompare.call(this, that, locales, options);
             }
-            return origLocaleCompare.call(this, that, resolveLocaleArg(locales), options);
+            return origLocaleCompare.call(this, that, resolveLocaleArg(locales, realmGetCanonicalLocales), options);
           });
         }
 
@@ -949,7 +1088,7 @@
             if (ctor && ctor.prototype && typeof ctor.prototype.toLocaleString === 'function') {
               const origTls = ctor.prototype.toLocaleString;
               patchProtoMethod(ctor.prototype, 'toLocaleString', 0, function (locales, options) {
-                return origTls.call(this, resolveLocaleArg(locales), options);
+                return origTls.call(this, resolveLocaleArg(locales, realmGetCanonicalLocales), options);
               });
             }
           }
@@ -957,10 +1096,10 @@
 
         // Patch BOTH Window Navigator.prototype AND Worker WorkerNavigator.prototype with C++ brand validation!
         if (win.Navigator && win.Navigator.prototype) {
-          patchNavigatorProto(win.Navigator.prototype, realmLanguages, RealmObject);
+          patchNavigatorProto(win.Navigator.prototype, realmLanguages, RealmObject, RealmError);
         }
         if (win.WorkerNavigator && win.WorkerNavigator.prototype) {
-          patchNavigatorProto(win.WorkerNavigator.prototype, realmLanguages, RealmObject);
+          patchNavigatorProto(win.WorkerNavigator.prototype, realmLanguages, RealmObject, RealmError);
         }
 
         if (
@@ -987,7 +1126,7 @@
                 const ov = voiceOverrides.get(this);
                 if (ov && prop in ov) return ov[prop];
                 return rawVal;
-              }, RealmObject);
+              }, RealmObject, RealmError);
               realmDefine(ssvProto, prop, {
                 get: getter,
                 set: undefined,
@@ -1057,9 +1196,10 @@
         }
       }
 
-      // 6. Dedicated & Shared Web Worker synchronization (fixes `Worker reads a different navigator than the page`!)
+      // 6. Dedicated & Shared Web Worker synchronization (blob: & data: workers)
       const RealmURL = win.URL;
       const RealmBlob = win.Blob;
+      const origSetTimeout = typeof win.setTimeout === 'function' ? win.setTimeout : null;
       const origCreateObjectURL = RealmURL && typeof RealmURL.createObjectURL === 'function'
         ? RealmURL.createObjectURL
         : null;
@@ -1068,15 +1208,20 @@
         : null;
 
       if (origCreateObjectURL && RealmBlob) {
+        const realmBlobSizeGet = RealmBlob.prototype
+          ? realmGetOwnDesc(RealmBlob.prototype, 'size')?.get
+          : null;
+        if (realmBlobSizeGet) blobSizeGetters.add(realmBlobSizeGet);
         const createDesc = realmGetOwnDesc(RealmURL, 'createObjectURL');
         if (!createDesc || createDesc.configurable) {
           const wrappedCreateObjUrl = makeMethod('createObjectURL', 1, function (obj) {
             const url = reflectApply(origCreateObjectURL, this, arguments);
-            if (obj instanceof RealmBlob && typeof url === 'string') {
+            // Brand-check via C++ Blob.prototype.size so Blobs created in child iframes are tracked too!
+            if (typeof url === 'string' && isGenuineBlob(obj)) {
               trackedBlobs.set(url, obj);
             }
             return url;
-          }, RealmObject);
+          }, RealmObject, RealmError);
           realmDefine(RealmURL, 'createObjectURL', {
             value: wrappedCreateObjUrl,
             writable: true,
@@ -1091,7 +1236,7 @@
             const wrappedRevokeObjUrl = makeMethod('revokeObjectURL', 1, function (url) {
               trackedBlobs.delete(String(url));
               return reflectApply(origRevokeObjectURL, this, arguments);
-            }, RealmObject);
+            }, RealmObject, RealmError);
             realmDefine(RealmURL, 'revokeObjectURL', {
               value: wrappedRevokeObjUrl,
               writable: true,
@@ -1101,53 +1246,88 @@
           }
         }
 
-        const buildPatchedWorkerScriptUrl = (rawScriptUrl, options) => {
+        const scheduleUrlCleanup = (urls) => {
+          if (!origRevokeObjectURL || !origSetTimeout || !Array.isArray(urls) || urls.length === 0) return;
+          try {
+            origSetTimeout.call(win, () => {
+              for (let i = 0; i < urls.length; i++) {
+                try {
+                  origRevokeObjectURL.call(RealmURL, urls[i]);
+                } catch (_) {}
+              }
+            }, 20000);
+          } catch (_) {}
+        };
+
+        const buildPatchedWorkerScript = (rawScriptUrl, options) => {
           if (typeof rawScriptUrl !== 'string' && !(rawScriptUrl && typeof rawScriptUrl === 'object')) {
+            return null;
+          }
+          // Skip TrustedScriptURL objects so Trusted Types CSP never fires `securitypolicyviolation`
+          if (win.TrustedScriptURL && rawScriptUrl instanceof win.TrustedScriptURL) {
             return null;
           }
           const urlStr = String(rawScriptUrl);
           const isModule = Boolean(options && typeof options === 'object' && options.type === 'module');
 
-          // 1) blob: URL created via URL.createObjectURL
+          // 1) blob: URL created via URL.createObjectURL (across any same-origin realm)
+          //    Keep `origBlob` as its own separate compilation unit via a private unrevoked Blob URL:
+          //    - Survives synchronous `URL.revokeObjectURL(urlStr)` right after `new Worker(urlStr)`!
+          //    - Preserves `"use strict";` directive prologue & sloppy/strict semantics inside `origBlob`!
+          //    - Keeps `SELF_STACK_MARKER` isolated to the outer bootstrap URL so worker stacks stay intact!
           if (urlStr.startsWith('blob:')) {
             const origBlob = trackedBlobs.get(urlStr);
-            if (origBlob) {
-              const merged = new RealmBlob([WORKER_BOOTSTRAP_SNIPPET, origBlob], {
-                type: origBlob.type || 'application/javascript'
-              });
-              return origCreateObjectURL.call(RealmURL, merged);
+            if (!origBlob) {
+              return null;
             }
-            if (!isModule) {
-              const shim = `${WORKER_BOOTSTRAP_SNIPPET}importScripts(${JSON.stringify(urlStr)});\n`;
-              return origCreateObjectURL.call(RealmURL, new RealmBlob([shim], { type: 'application/javascript' }));
+            const privateInnerUrl = origCreateObjectURL.call(RealmURL, origBlob);
+            if (isModule) {
+              const bootUrl = origCreateObjectURL.call(
+                RealmURL,
+                new RealmBlob([WORKER_BOOTSTRAP_SNIPPET], { type: 'text/javascript' })
+              );
+              const modLoader = `import ${JSON.stringify(bootUrl)};\nimport ${JSON.stringify(privateInnerUrl)};\n`;
+              const outerUrl = origCreateObjectURL.call(
+                RealmURL,
+                new RealmBlob([modLoader], { type: 'text/javascript' })
+              );
+              return { outerUrl, cleanupUrls: [outerUrl, bootUrl, privateInnerUrl] };
             }
-            return null;
+            const shim = `${WORKER_BOOTSTRAP_SNIPPET}try{importScripts(${JSON.stringify(privateInnerUrl)});}finally{try{URL.revokeObjectURL(${JSON.stringify(privateInnerUrl)});}catch(_){}}\n`;
+            const outerUrl = origCreateObjectURL.call(
+              RealmURL,
+              new RealmBlob([shim], { type: 'application/javascript' })
+            );
+            return { outerUrl, cleanupUrls: [outerUrl, privateInnerUrl] };
           }
 
           // 2) data: URL worker
           if (urlStr.startsWith('data:')) {
-            if (!isModule) {
-              const shim = `${WORKER_BOOTSTRAP_SNIPPET}importScripts(${JSON.stringify(urlStr)});\n`;
-              return origCreateObjectURL.call(RealmURL, new RealmBlob([shim], { type: 'application/javascript' }));
+            if (isModule) {
+              const bootUrl = origCreateObjectURL.call(
+                RealmURL,
+                new RealmBlob([WORKER_BOOTSTRAP_SNIPPET], { type: 'text/javascript' })
+              );
+              const modLoader = `import ${JSON.stringify(bootUrl)};\nimport ${JSON.stringify(urlStr)};\n`;
+              const outerUrl = origCreateObjectURL.call(
+                RealmURL,
+                new RealmBlob([modLoader], { type: 'text/javascript' })
+              );
+              return { outerUrl, cleanupUrls: [outerUrl, bootUrl] };
             }
-            return null;
+            const shim = `${WORKER_BOOTSTRAP_SNIPPET}importScripts(${JSON.stringify(urlStr)});\n`;
+            const outerUrl = origCreateObjectURL.call(
+              RealmURL,
+              new RealmBlob([shim], { type: 'application/javascript' })
+            );
+            return { outerUrl, cleanupUrls: [outerUrl] };
           }
 
-          // 3) Same-origin http(s) worker script URL
-          try {
-            const baseHref = win.location && win.location.href;
-            if (!baseHref) return null;
-            const resolved = new RealmURL(urlStr, baseHref);
-            if (
-              (resolved.protocol === 'http:' || resolved.protocol === 'https:') &&
-              resolved.origin === win.location.origin
-            ) {
-              const loader = isModule
-                ? `${WORKER_BOOTSTRAP_SNIPPET}import ${JSON.stringify(resolved.href)};\n`
-                : `${WORKER_BOOTSTRAP_SNIPPET}importScripts(${JSON.stringify(resolved.href)});\n`;
-              return origCreateObjectURL.call(RealmURL, new RealmBlob([loader], { type: 'application/javascript' }));
-            }
-          } catch (_) {}
+          // Note: Do NOT rewrite http:/https: worker URLs to blob:, because:
+          // - Strict `worker-src 'self'` / `script-src 'self'` CSP blocks blob: asynchronously
+          //   (without throwing in `new Worker()`) and emits `securitypolicyviolation` events.
+          // - Replacing https: with blob: breaks `self.location.pathname`, `self.location.search`,
+          //   and relative fetch()/importScripts() inside the worker.
           return null;
         };
 
@@ -1162,32 +1342,34 @@
               try {
                 return reflectApply(target, thisArg, args);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             },
             construct(target, args, newTarget) {
               try {
                 if (args.length >= 1) {
-                  let patchedUrl = null;
+                  let patched = null;
                   try {
-                    patchedUrl = buildPatchedWorkerScriptUrl(args[0], args[1]);
+                    patched = buildPatchedWorkerScript(args[0], args[1]);
                   } catch (_) {}
-                  if (patchedUrl) {
+                  if (patched && patched.outerUrl) {
                     try {
                       const nextArgs = args.slice();
-                      nextArgs[0] = patchedUrl;
-                      return reflectConstruct(target, nextArgs, newTarget);
+                      nextArgs[0] = patched.outerUrl;
+                      const instance = reflectConstruct(target, nextArgs, newTarget);
+                      scheduleUrlCleanup(patched.cleanupUrls);
+                      return instance;
                     } catch (_) {
-                      // Fallback to unpatched URL if strict worker-src CSP forbids blob:
+                      scheduleUrlCleanup(patched.cleanupUrls);
                     }
                   }
                 }
                 return reflectConstruct(target, args, newTarget);
               } catch (e) {
-                throw cleanErrorStack(e, RealmObject);
+                throw cleanErrorStack(e, RealmObject, RealmError);
               }
             }
-          }, RealmObject);
+          }, RealmObject, RealmError);
 
           if (OrigWorkerCtor.prototype) {
             realmDefine(OrigWorkerCtor.prototype, 'constructor', {
@@ -1217,21 +1399,60 @@
         ? realmGetOwnDesc(win.HTMLFrameElement.prototype, 'contentWindow')?.get
         : null;
 
-      const patchNodeFrames = (node) => {
-        if (!node || typeof node !== 'object') return;
+      const patchSingleFrameEl = (el) => {
+        if (!el || typeof el !== 'object') return;
         try {
-          if (origIframeCwGet && win.HTMLIFrameElement && node instanceof win.HTMLIFrameElement) {
-            const cw = origIframeCwGet.call(node);
-            if (cw) patchRealm(cw);
-          } else if (origFrameCwGet && win.HTMLFrameElement && node instanceof win.HTMLFrameElement) {
-            const cw = origFrameCwGet.call(node);
-            if (cw) patchRealm(cw);
+          if (origIframeCwGet) {
+            try {
+              const cw = origIframeCwGet.call(el);
+              if (cw) {
+                patchRealm(cw);
+                return;
+              }
+            } catch (_) {}
           }
-          if (typeof node.getElementsByTagName === 'function' && origIframeCwGet) {
-            const list = node.getElementsByTagName('iframe');
-            for (let i = 0; i < list.length; i++) {
-              const cw = origIframeCwGet.call(list[i]);
+          if (origFrameCwGet) {
+            try {
+              const cw = origFrameCwGet.call(el);
               if (cw) patchRealm(cw);
+            } catch (_) {}
+          }
+        } catch (_) {}
+      };
+
+      const collectFragmentFrames = (node) => {
+        if (!node || typeof node !== 'object') return null;
+        try {
+          if (node.nodeType === 11 && typeof node.querySelectorAll === 'function') {
+            const found = node.querySelectorAll('iframe, frame');
+            return found && found.length > 0 ? Array.from(found) : null;
+          }
+        } catch (_) {}
+        return null;
+      };
+
+      const patchNodeFrames = (node, preCollected) => {
+        if (preCollected) {
+          for (let i = 0; i < preCollected.length; i++) {
+            patchSingleFrameEl(preCollected[i]);
+          }
+          return;
+        }
+        if (!node || typeof node !== 'object') return;
+        patchSingleFrameEl(node);
+        try {
+          if (typeof node.getElementsByTagName === 'function') {
+            if (origIframeCwGet) {
+              const list = node.getElementsByTagName('iframe');
+              for (let i = 0; i < list.length; i++) {
+                patchSingleFrameEl(list[i]);
+              }
+            }
+            if (origFrameCwGet) {
+              const fList = node.getElementsByTagName('frame');
+              for (let i = 0; i < fList.length; i++) {
+                patchSingleFrameEl(fList[i]);
+              }
             }
           }
         } catch (_) {}
@@ -1247,7 +1468,7 @@
             const childWin = origCwGet.call(this);
             if (childWin) patchRealm(childWin);
             return childWin;
-          }, RealmObject);
+          }, RealmObject, RealmError);
           realmDefine(fp, 'contentWindow', {
             get: getCw,
             set: undefined,
@@ -1262,7 +1483,7 @@
             const childDoc = origCdGet.call(this);
             if (childDoc && childDoc.defaultView) patchRealm(childDoc.defaultView);
             return childDoc;
-          }, RealmObject);
+          }, RealmObject, RealmError);
           realmDefine(fp, 'contentDocument', {
             get: getCd,
             set: undefined,
@@ -1284,10 +1505,11 @@
           if (desc && typeof desc.value === 'function' && desc.configurable) {
             const origDomFn = desc.value;
             const wrapped = makeMethod(mName, arity, function () {
+              const pre = collectFragmentFrames(arguments[0]);
               const res = reflectApply(origDomFn, this, arguments);
-              patchNodeFrames(arguments[0]);
+              patchNodeFrames(arguments[0], pre);
               return res;
-            }, RealmObject);
+            }, RealmObject, RealmError);
             realmDefine(np, mName, {
               value: wrapped,
               writable: Boolean(desc.writable),
@@ -1305,16 +1527,24 @@
           if (desc && typeof desc.value === 'function' && desc.configurable) {
             const origElFn = desc.value;
             const wrapped = makeMethod(mName, arity, function () {
+              let preList = null;
+              if (mName !== 'insertAdjacentHTML' && arguments.length > 0) {
+                for (let i = 0; i < arguments.length; i++) {
+                  const cf = collectFragmentFrames(arguments[i]);
+                  if (cf) preList = preList ? preList.concat(cf) : cf;
+                }
+              }
               const res = reflectApply(origElFn, this, arguments);
               if (mName === 'insertAdjacentHTML') {
-                patchNodeFrames(this);
+                patchNodeFrames(this, null);
               } else {
+                if (preList) patchNodeFrames(null, preList);
                 for (let i = 0; i < arguments.length; i++) {
-                  patchNodeFrames(arguments[i]);
+                  patchNodeFrames(arguments[i], null);
                 }
               }
               return res;
-            }, RealmObject);
+            }, RealmObject, RealmError);
             realmDefine(ep, mName, {
               value: wrapped,
               writable: Boolean(desc.writable),
@@ -1329,9 +1559,9 @@
           const origIhSet = ihDesc.set;
           const setIh = makeSetter('innerHTML', function (val) {
             const res = origIhSet.call(this, val);
-            patchNodeFrames(this);
+            patchNodeFrames(this, null);
             return res;
-          }, RealmObject);
+          }, RealmObject, RealmError);
           realmDefine(ep, 'innerHTML', {
             get: ihDesc.get,
             set: setIh,
@@ -1352,7 +1582,7 @@
             const opened = reflectApply(origOpen, this, arguments);
             if (opened) patchRealm(opened);
             return opened;
-          }, RealmObject);
+          }, RealmObject, RealmError);
           realmDefine(openTarget, 'open', {
             value: wrappedOpen,
             writable: Boolean(openDesc.writable),

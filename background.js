@@ -12,6 +12,8 @@ const {
 } = self.TZ_PROFILES_DATA;
 
 const DNR_RULE_ID = 1001;
+const DNR_BYPASS_INITIATOR_RULE_ID = 1002;
+const DNR_BYPASS_TAB_RULE_ID = 1003;
 const CONTENT_SCRIPT_ID = 'tz_global_main';
 const VPN_WATCHDOG_ALARM = 'tz_vpn_watchdog';
 const SETTING_KEYS = [
@@ -99,7 +101,7 @@ function isWatchdogActive(state) {
 }
 
 // Read genuine Chrome UA + Windows 11 High-Entropy Client Hints once so CDP setUserAgentOverride
-// never strips platformVersion, bitness, architecture, or fullVersionList
+// never strips platformVersion, bitness, architecture, formFactors, or fullVersionList
 function getNativeUaPayload() {
   if (cachedUaPayloadPromise) return cachedUaPayloadPromise;
   cachedUaPayloadPromise = (async () => {
@@ -113,6 +115,7 @@ function getNativeUaPayload() {
           'architecture',
           'bitness',
           'brands',
+          'formFactors',
           'fullVersionList',
           'mobile',
           'model',
@@ -124,17 +127,27 @@ function getNativeUaPayload() {
         if (brands.length > 0 && he.platform) {
           userAgentMetadata = {
             brands: brands.map((b) => ({ brand: String(b.brand), version: String(b.version) })),
-            fullVersionList: Array.isArray(he.fullVersionList)
-              ? he.fullVersionList.map((b) => ({ brand: String(b.brand), version: String(b.version) }))
-              : undefined,
             platform: String(he.platform || ''),
             platformVersion: String(he.platformVersion || ''),
             architecture: String(he.architecture || ''),
             model: String(he.model || ''),
-            mobile: Boolean(he.mobile),
-            bitness: he.bitness ? String(he.bitness) : undefined,
-            wow64: typeof he.wow64 === 'boolean' ? he.wow64 : undefined
+            mobile: Boolean(he.mobile)
           };
+          if (Array.isArray(he.fullVersionList) && he.fullVersionList.length > 0) {
+            userAgentMetadata.fullVersionList = he.fullVersionList.map((b) => ({
+              brand: String(b.brand),
+              version: String(b.version)
+            }));
+          }
+          if (he.bitness) {
+            userAgentMetadata.bitness = String(he.bitness);
+          }
+          if (typeof he.wow64 === 'boolean') {
+            userAgentMetadata.wow64 = he.wow64;
+          }
+          if (Array.isArray(he.formFactors) && he.formFactors.length > 0) {
+            userAgentMetadata.formFactors = he.formFactors.map((f) => String(f));
+          }
         }
       }
     } catch (_) {}
@@ -143,47 +156,136 @@ function getNativeUaPayload() {
   return cachedUaPayloadPromise;
 }
 
-// 1. Update Accept-Language HTTP Header via declarativeNetRequest across ALL resource types (including WebSocket)
+// 1. Update Accept-Language HTTP Header & Excluded-Tab Subframe Bypass via Session Rules
+// Using session rules enables `excludedTabIds` / `tabIds`, ensuring cross-origin iframes (like
+// challenges.cloudflare.com) inside an excluded site tab are 100% untouched in both headers and JS!
+let legacyDynamicRulesCleared = false;
+
+async function getExcludedTabIds(state) {
+  if (!state.enabled || !Array.isArray(state.excludedSites) || state.excludedSites.length === 0) {
+    return [];
+  }
+  try {
+    const tabs = await chrome.tabs.query({});
+    const ids = [];
+    for (const t of tabs) {
+      if (typeof t.id === 'number') {
+        const u = t.pendingUrl || t.url || '';
+        if (u && isUrlExcluded(u, state.excludedSites)) {
+          ids.push(t.id);
+        }
+      }
+    }
+    return ids;
+  } catch (_) {
+    return [];
+  }
+}
+
 async function syncNetworkHeaders(state) {
   try {
-    if (!state.enabled || !state.spoofLang) {
+    if (!legacyDynamicRulesCleared) {
       await chrome.declarativeNetRequest.updateDynamicRules({
-        removeRuleIds: [DNR_RULE_ID]
-      });
+        removeRuleIds: [DNR_RULE_ID, DNR_BYPASS_INITIATOR_RULE_ID, DNR_BYPASS_TAB_RULE_ID]
+      }).catch(() => {});
+      legacyDynamicRulesCleared = true;
+    }
+
+    const removeRuleIds = [DNR_RULE_ID, DNR_BYPASS_INITIATOR_RULE_ID, DNR_BYPASS_TAB_RULE_ID];
+    if (!state.enabled) {
+      await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds });
       return;
     }
 
-    const profile = getProfile(state.profileId);
-    const condition = {
-      urlFilter: '*',
-      excludedResourceTypes: []
-    };
+    const excludedTabIds = await getExcludedTabIds(state);
+    const langRules = [];
+    const bypassRules = [];
 
-    if (state.excludedSites.length > 0) {
-      condition.excludedInitiatorDomains = state.excludedSites;
-      condition.excludedRequestDomains = state.excludedSites;
+    if (state.spoofLang) {
+      const profile = getProfile(state.profileId);
+      const condition = {
+        urlFilter: '*',
+        excludedResourceTypes: []
+      };
+
+      if (state.excludedSites.length > 0) {
+        condition.excludedInitiatorDomains = state.excludedSites;
+        condition.excludedRequestDomains = state.excludedSites;
+      }
+      if (excludedTabIds.length > 0) {
+        condition.excludedTabIds = excludedTabIds;
+      }
+
+      langRules.push({
+        id: DNR_RULE_ID,
+        priority: 1,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            {
+              header: 'Accept-Language',
+              operation: 'set',
+              value: profile.acceptLanguage
+            }
+          ]
+        },
+        condition
+      });
     }
 
-    await chrome.declarativeNetRequest.updateDynamicRules({
+    await chrome.declarativeNetRequest.updateSessionRules({
       removeRuleIds: [DNR_RULE_ID],
-      addRules: [
-        {
-          id: DNR_RULE_ID,
-          priority: 1,
+      addRules: langRules
+    });
+
+    // Signal `inject.js` inside cross-origin subframes (e.g. challenges.cloudflare.com) to abort at line 1
+    // whenever the parent/top tab belongs to `excludedSites`
+    if (!state.cdpMode && state.excludedSites.length > 0) {
+      bypassRules.push({
+        id: DNR_BYPASS_INITIATOR_RULE_ID,
+        priority: 2,
+        action: {
+          type: 'modifyHeaders',
+          responseHeaders: [
+            {
+              header: 'Server-Timing',
+              operation: 'append',
+              value: 'tz_bypass'
+            }
+          ]
+        },
+        condition: {
+          initiatorDomains: state.excludedSites,
+          resourceTypes: ['sub_frame']
+        }
+      });
+
+      if (excludedTabIds.length > 0) {
+        bypassRules.push({
+          id: DNR_BYPASS_TAB_RULE_ID,
+          priority: 2,
           action: {
             type: 'modifyHeaders',
-            requestHeaders: [
+            responseHeaders: [
               {
-                header: 'Accept-Language',
-                operation: 'set',
-                value: profile.acceptLanguage
+                header: 'Server-Timing',
+                operation: 'append',
+                value: 'tz_bypass'
               }
             ]
           },
-          condition
-        }
-      ]
-    });
+          condition: {
+            tabIds: excludedTabIds,
+            resourceTypes: ['sub_frame']
+          }
+        });
+      }
+    }
+
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [DNR_BYPASS_INITIATOR_RULE_ID, DNR_BYPASS_TAB_RULE_ID],
+      addRules: bypassRules
+    }).catch(() => {});
   } catch (err) {
     console.warn('DNR sync error:', err);
   }
@@ -284,39 +386,65 @@ async function getExtensionAttachedTabIds() {
   }
 }
 
-function recordChildSession(tabId, sessionId) {
-  if (typeof tabId !== 'number' || !sessionId) return;
-  let set = tabChildSessions.get(tabId);
-  if (!set) {
-    set = new Set();
-    tabChildSessions.set(tabId, set);
+let cdpKeepAliveTimer = null;
+
+function updateCdpKeepAlive(shouldRun) {
+  if (shouldRun) {
+    if (!cdpKeepAliveTimer) {
+      // Prevent MV3 Service Worker suspension while `waitForDebuggerOnStart: true` is active on tabs
+      cdpKeepAliveTimer = setInterval(() => {
+        chrome.runtime.getPlatformInfo().catch(() => {});
+      }, 20000);
+    }
+  } else if (cdpKeepAliveTimer) {
+    clearInterval(cdpKeepAliveTimer);
+    cdpKeepAliveTimer = null;
   }
-  set.add(sessionId);
+}
+
+function recordChildSession(tabId, sessionId, targetType) {
+  if (typeof tabId !== 'number' || !sessionId) return;
+  let map = tabChildSessions.get(tabId);
+  if (!map) {
+    map = new Map();
+    tabChildSessions.set(tabId, map);
+  }
+  map.set(sessionId, targetType || '');
 }
 
 function removeChildSession(tabId, sessionId) {
-  const set = tabChildSessions.get(tabId);
-  if (!set) return;
+  const map = tabChildSessions.get(tabId);
+  if (!map) return;
   if (sessionId) {
-    set.delete(sessionId);
-    if (set.size === 0) tabChildSessions.delete(tabId);
+    map.delete(sessionId);
+    if (map.size === 0) tabChildSessions.delete(tabId);
   } else {
     tabChildSessions.delete(tabId);
   }
 }
 
-async function applyOverridesToCdpTarget(debuggee, state, uaPayload) {
+function isWorkerTargetType(targetType) {
+  return targetType === 'worker' || targetType === 'shared_worker' || targetType === 'service_worker';
+}
+
+async function applyOverridesToCdpTarget(debuggee, state, uaPayload, targetType) {
   const profile = getProfile(state.profileId);
   const tz = getEffectiveTimezone(state);
-
-  await chrome.debugger.sendCommand(debuggee, 'Emulation.setTimezoneOverride', {
-    timezoneId: tz
-  }).catch(() => {});
+  const isWorker = isWorkerTargetType(targetType);
+  const cmds = [
+    chrome.debugger.sendCommand(debuggee, 'Emulation.setTimezoneOverride', {
+      timezoneId: tz
+    }).catch(() => {})
+  ];
 
   if (state.spoofLang) {
-    await chrome.debugger.sendCommand(debuggee, 'Emulation.setLocaleOverride', {
-      locale: profile.locale
-    }).catch(() => {});
+    if (!isWorker) {
+      cmds.push(
+        chrome.debugger.sendCommand(debuggee, 'Emulation.setLocaleOverride', {
+          locale: profile.locale
+        }).catch(() => {})
+      );
+    }
 
     if (uaPayload && uaPayload.userAgent) {
       // Pass comma-separated language tags WITHOUT ';q=0.9' so Chromium sets clean navigator.languages
@@ -330,16 +458,26 @@ async function applyOverridesToCdpTarget(debuggee, state, uaPayload) {
       if (uaPayload.userAgentMetadata) {
         uaOverride.userAgentMetadata = uaPayload.userAgentMetadata;
       }
-      await chrome.debugger.sendCommand(debuggee, 'Emulation.setUserAgentOverride', uaOverride).catch(() => {});
+      cmds.push(
+        chrome.debugger.sendCommand(debuggee, 'Emulation.setUserAgentOverride', uaOverride).catch(() => {})
+      );
     }
   } else {
-    await chrome.debugger.sendCommand(debuggee, 'Emulation.setLocaleOverride', {
-      locale: ''
-    }).catch(() => {});
-    await chrome.debugger.sendCommand(debuggee, 'Emulation.setUserAgentOverride', {
-      userAgent: ''
-    }).catch(() => {});
+    if (!isWorker) {
+      cmds.push(
+        chrome.debugger.sendCommand(debuggee, 'Emulation.setLocaleOverride', {
+          locale: ''
+        }).catch(() => {})
+      );
+    }
+    cmds.push(
+      chrome.debugger.sendCommand(debuggee, 'Emulation.setUserAgentOverride', {
+        userAgent: ''
+      }).catch(() => {})
+    );
   }
+
+  await Promise.all(cmds);
 }
 
 async function detachCdpFromTab(tabId, attachedSet) {
@@ -359,6 +497,7 @@ async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
     return;
   }
 
+  updateCdpKeepAlive(true);
   const target = { tabId };
   const uaPayload = await getNativeUaPayload();
 
@@ -368,22 +507,23 @@ async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
       known.add(tabId);
     }
 
-    await applyOverridesToCdpTarget(target, state, uaPayload);
-
-    // Auto-attach to out-of-process cross-origin iframes (e.g. challenges.cloudflare.com)
-    // and Dedicated/Shared/Service Workers BEFORE their first script instruction runs
-    await chrome.debugger.sendCommand(target, 'Target.setAutoAttach', {
-      autoAttach: true,
-      waitForDebuggerOnStart: true,
-      flatten: true
-    }).catch(() => {});
+    await Promise.all([
+      applyOverridesToCdpTarget(target, state, uaPayload, 'page'),
+      // Auto-attach to out-of-process cross-origin iframes (e.g. challenges.cloudflare.com)
+      // and Dedicated/Shared/Service Workers BEFORE their first script instruction runs
+      chrome.debugger.sendCommand(target, 'Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,
+        flatten: true
+      }).catch(() => {})
+    ]);
 
     // Also refresh any already-attached child sessions on this tab
     const children = tabChildSessions.get(tabId);
     if (children && children.size > 0) {
       await Promise.all(
-        Array.from(children).map((sessionId) =>
-          applyOverridesToCdpTarget({ tabId, sessionId }, state, uaPayload)
+        Array.from(children.entries()).map(([sessionId, childType]) =>
+          applyOverridesToCdpTarget({ tabId, sessionId }, state, uaPayload, childType)
         )
       );
     }
@@ -391,6 +531,7 @@ async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
 }
 
 async function detachAllCdp() {
+  updateCdpKeepAlive(false);
   tabChildSessions.clear();
   const attached = await getExtensionAttachedTabIds();
   await Promise.all(
@@ -407,6 +548,7 @@ async function syncCdpMode(state) {
     await detachAllCdp();
     return;
   }
+  updateCdpKeepAlive(true);
   const [tabs, attached] = await Promise.all([
     chrome.tabs.query({}),
     getExtensionAttachedTabIds()
@@ -428,13 +570,26 @@ if (chrome.debugger && chrome.debugger.onEvent) {
     if (method === 'Target.attachedToTarget') {
       const sessionId = params && params.sessionId;
       if (!sessionId) return;
-      recordChildSession(source.tabId, sessionId);
+      const targetType = (params.targetInfo && params.targetInfo.type) || '';
+      recordChildSession(source.tabId, sessionId, targetType);
       const childTarget = { tabId: source.tabId, sessionId };
       try {
         const state = cachedState || await getState();
         if (state.enabled && state.cdpMode) {
           const uaPayload = await getNativeUaPayload();
-          await applyOverridesToCdpTarget(childTarget, state, uaPayload);
+          const tasks = [applyOverridesToCdpTarget(childTarget, state, uaPayload, targetType)];
+          // Crucial: enable recursive auto-attach on OOPIF child frames (like challenges.cloudflare.com)
+          // so Dedicated Web Workers spawned INSIDE cross-origin iframes get overridden too!
+          if (!isWorkerTargetType(targetType)) {
+            tasks.push(
+              chrome.debugger.sendCommand(childTarget, 'Target.setAutoAttach', {
+                autoAttach: true,
+                waitForDebuggerOnStart: true,
+                flatten: true
+              }).catch(() => {})
+            );
+          }
+          await Promise.all(tasks);
         }
       } catch (_) {
       } finally {
@@ -731,8 +886,8 @@ function scheduleApplyAllSettings() {
   return syncChain;
 }
 
-// Warm up state & UA metadata immediately on Service Worker boot
-getState().catch(() => {});
+// Warm up state, session rules & UA metadata immediately on Service Worker boot
+scheduleApplyAllSettings();
 getNativeUaPayload().catch(() => {});
 
 if (self.navigator && self.navigator.connection && typeof self.navigator.connection.addEventListener === 'function') {
@@ -815,8 +970,19 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   const url = tab.pendingUrl || tab.url || '';
   if (!url) return;
   const state = cachedState || await getState();
+  if (state.enabled && state.excludedSites.length > 0 && isUrlExcluded(url, state.excludedSites)) {
+    await syncNetworkHeaders(state);
+  }
   if (state.enabled && state.cdpMode && isHttpUrl(url)) {
     await applyCdpToTab(tab.id, url, state);
+  }
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  removeChildSession(tabId);
+  const state = cachedState || await getState();
+  if (state.enabled && state.excludedSites.length > 0) {
+    await syncNetworkHeaders(state);
   }
 });
 
@@ -829,6 +995,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const url = changeInfo.url || (tab && (tab.pendingUrl || tab.url)) || '';
   if ((changeInfo.status === 'loading' || changeInfo.url) && url) {
     const state = cachedState || await getState();
+    if (state.enabled && state.excludedSites.length > 0) {
+      await syncNetworkHeaders(state);
+    }
     if (state.enabled && state.cdpMode) {
       await applyCdpToTab(tabId, url, state);
     }
