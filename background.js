@@ -1,88 +1,21 @@
 'use strict';
 
-const PROFILES = {
-  "us_east": {
-    "id": "us_east",
-    "label": "US East — Atlanta / Ashburn",
-    "tz": "America/New_York",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "us_mountain": {
-    "id": "us_mountain",
-    "label": "US Mountain — Denver",
-    "tz": "America/Denver",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "us_central": {
-    "id": "us_central",
-    "label": "US Central — Chicago / Dallas",
-    "tz": "America/Chicago",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "us_west": {
-    "id": "us_west",
-    "label": "US West — Los Angeles / Seattle",
-    "tz": "America/Los_Angeles",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "uk_london": {
-    "id": "uk_london",
-    "label": "UK — London",
-    "tz": "Europe/London",
-    "locale": "en-GB",
-    "languages": [
-      "en-GB",
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-GB,en-US;q=0.9,en;q=0.8"
-  },
-  "eu_central": {
-    "id": "eu_central",
-    "label": "Europe — Frankfurt / Amsterdam",
-    "tz": "Europe/Berlin",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  }
-};
+importScripts('profiles-data.js');
 
-const DEFAULT_STATE = {
-  enabled: true,
-  profileId: 'us_east',
-  spoofLang: true,
-  cdpMode: false,
-  excludedSites: [] // array of normalized base domains, e.g. ["kinopoisk.ru", "gosuslugi.ru"]
-};
-
+const { DEFAULT_STATE, resolveProfileId, getProfile } = self.TZ_PROFILES_DATA;
 const DNR_RULE_ID = 1001;
-const attachedTabs = new Set();
 
 function normalizeDomain(host) {
-  return String(host || '').trim().toLowerCase().replace(/^www\./, '');
+  let s = String(host || '').trim().toLowerCase();
+  if (!s) return '';
+  try {
+    if (s.includes('://')) {
+      s = new URL(s).hostname;
+    } else {
+      s = s.split('/')[0].split(':')[0];
+    }
+  } catch (_) {}
+  return s.replace(/^www\./, '');
 }
 
 function isUrlExcluded(urlStr, excludedSites) {
@@ -103,6 +36,7 @@ function isUrlExcluded(urlStr, excludedSites) {
 async function getState() {
   const data = await chrome.storage.local.get(DEFAULT_STATE);
   const state = Object.assign({}, DEFAULT_STATE, data);
+  state.profileId = resolveProfileId(state.profileId);
   if (!Array.isArray(state.excludedSites)) {
     state.excludedSites = [];
   }
@@ -112,40 +46,29 @@ async function getState() {
   return state;
 }
 
-// 1. Update Accept-Language HTTP Header via declarativeNetRequest (skipping excludedSites)
+// 1. Update Accept-Language HTTP Header via declarativeNetRequest across ALL resource types (including WebSocket)
 async function syncNetworkHeaders(state) {
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [DNR_RULE_ID]
-    });
-
     if (!state.enabled || !state.spoofLang) {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [DNR_RULE_ID]
+      });
       return;
     }
 
-    const profile = PROFILES[state.profileId] || PROFILES.us_east;
+    const profile = getProfile(state.profileId);
     const condition = {
       urlFilter: '*',
-      resourceTypes: [
-        'main_frame',
-        'sub_frame',
-        'xmlhttprequest',
-        'script',
-        'stylesheet',
-        'image',
-        'font',
-        'object',
-        'ping',
-        'other'
-      ]
+      excludedResourceTypes: [] // Matches ALL resource types including main_frame, websocket, media, xmlhttprequest, etc.
     };
 
-    if (state.excludedSites && state.excludedSites.length > 0) {
+    if (state.excludedSites.length > 0) {
       condition.excludedInitiatorDomains = state.excludedSites;
       condition.excludedRequestDomains = state.excludedSites;
     }
 
     await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [DNR_RULE_ID],
       addRules: [
         {
           id: DNR_RULE_ID,
@@ -183,18 +106,19 @@ async function syncContentScripts(state) {
       return;
     }
 
-    const langSuffix = state.spoofLang ? 'lang1' : 'lang0';
+    const profileId = resolveProfileId(state.profileId);
+    const langFile = state.spoofLang ? 'profiles/_lang_on.js' : 'profiles/_lang_off.js';
+
     const excludeMatches = [];
-    for (const domain of state.excludedSites || []) {
+    for (const domain of state.excludedSites) {
       excludeMatches.push(`*://${domain}/*`);
       excludeMatches.push(`*://*.${domain}/*`);
     }
 
-    const mainProfileId = PROFILES[state.profileId] ? state.profileId : 'us_east';
     const globalRule = {
       id: 'tz_global_main',
       matches: ['<all_urls>'],
-      js: [`profiles/${mainProfileId}_${langSuffix}.js`, 'inject.js'],
+      js: [`profiles/${profileId}.js`, langFile, 'inject.js'],
       runAt: 'document_start',
       world: 'MAIN',
       allFrames: true,
@@ -211,60 +135,92 @@ async function syncContentScripts(state) {
   }
 }
 
-// 3. Optional CDP Engine Mode (skipping and detaching on excludedSites)
-async function detachCdpFromTab(tabId) {
-  if (!attachedTabs.has(tabId)) return;
-  attachedTabs.delete(tabId);
+// 3. Optional CDP Engine Mode (queries real Chrome debugger targets so Service Worker sleep never loses state)
+async function getExtensionAttachedTabIds() {
+  if (!chrome.debugger || typeof chrome.debugger.getTargets !== 'function') {
+    return new Set();
+  }
+  try {
+    const targets = await chrome.debugger.getTargets();
+    const myId = chrome.runtime.id;
+    const ids = new Set();
+    for (const t of targets) {
+      if (t.attached && typeof t.tabId === 'number' && (!t.extensionId || t.extensionId === myId)) {
+        ids.add(t.tabId);
+      }
+    }
+    return ids;
+  } catch (_) {
+    return new Set();
+  }
+}
+
+async function detachCdpFromTab(tabId, attachedSet) {
+  const known = attachedSet || await getExtensionAttachedTabIds();
+  if (!known.has(tabId)) return;
   try {
     await chrome.debugger.detach({ tabId });
   } catch (_) {}
 }
 
-async function applyCdpToTab(tabId, urlStr, state) {
+async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
+  const known = attachedSet || await getExtensionAttachedTabIds();
+
   if (!state.enabled || !state.cdpMode) {
-    await detachCdpFromTab(tabId);
+    await detachCdpFromTab(tabId, known);
     return;
   }
   if (!urlStr || (!urlStr.startsWith('http://') && !urlStr.startsWith('https://'))) {
+    await detachCdpFromTab(tabId, known);
     return;
   }
-
   if (isUrlExcluded(urlStr, state.excludedSites)) {
-    await detachCdpFromTab(tabId);
+    await detachCdpFromTab(tabId, known);
     return;
   }
 
-  const profile = PROFILES[state.profileId] || PROFILES.us_east;
+  const profile = getProfile(state.profileId);
   const target = { tabId };
 
   try {
-    if (!attachedTabs.has(tabId)) {
+    if (!known.has(tabId)) {
       await chrome.debugger.attach(target, '1.3');
-      attachedTabs.add(tabId);
+      known.add(tabId);
     }
+
     await chrome.debugger.sendCommand(target, 'Emulation.setTimezoneOverride', {
       timezoneId: profile.tz
     });
+
+    await chrome.debugger.sendCommand(target, 'Network.enable', {});
     if (state.spoofLang) {
       await chrome.debugger.sendCommand(target, 'Emulation.setLocaleOverride', {
         locale: profile.locale
       });
-      await chrome.debugger.sendCommand(target, 'Network.enable', {});
       await chrome.debugger.sendCommand(target, 'Network.setExtraHTTPHeaders', {
         headers: { 'Accept-Language': profile.acceptLanguage }
+      });
+    } else {
+      // Clear previous locale/header overrides when language spoofing is turned off while CDP remains active
+      await chrome.debugger.sendCommand(target, 'Emulation.setLocaleOverride', {
+        locale: ''
+      });
+      await chrome.debugger.sendCommand(target, 'Network.setExtraHTTPHeaders', {
+        headers: {}
       });
     }
   } catch (_) {}
 }
 
 async function detachAllCdp() {
-  const tabs = Array.from(attachedTabs);
-  attachedTabs.clear();
-  for (const tabId of tabs) {
-    try {
-      await chrome.debugger.detach({ tabId });
-    } catch (_) {}
-  }
+  const attached = await getExtensionAttachedTabIds();
+  await Promise.all(
+    Array.from(attached).map(async (tabId) => {
+      try {
+        await chrome.debugger.detach({ tabId });
+      } catch (_) {}
+    })
+  );
 }
 
 async function syncCdpMode(state) {
@@ -272,10 +228,14 @@ async function syncCdpMode(state) {
     await detachAllCdp();
     return;
   }
-  const tabs = await chrome.tabs.query({});
+  const [tabs, attached] = await Promise.all([
+    chrome.tabs.query({}),
+    getExtensionAttachedTabIds()
+  ]);
+
   for (const tab of tabs) {
-    if (tab.id && tab.url) {
-      await applyCdpToTab(tab.id, tab.url, state);
+    if (tab.id) {
+      await applyCdpToTab(tab.id, tab.url || '', state, attached);
     }
   }
 }
@@ -292,25 +252,21 @@ async function syncBadge(state) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (activeTab && activeTab.url && isUrlExcluded(activeTab.url, state.excludedSites)) {
       await chrome.action.setBadgeText({ text: 'SYS' });
-      await chrome.action.setBadgeBackgroundColor({ color: '#64748b' });
+      await chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
       return;
     }
   } catch (_) {}
 
-  const badgeMap = {
-    us_east: 'EST',
-    us_mountain: 'MST',
-    us_central: 'CST',
-    us_west: 'PST',
-    uk_london: 'UK',
-    eu_central: 'EU'
-  };
-  const txt = badgeMap[state.profileId] || 'ON';
-  await chrome.action.setBadgeText({ text: txt });
+  const profile = getProfile(state.profileId);
+  await chrome.action.setBadgeText({ text: profile.badge || 'ON' });
   await chrome.action.setBadgeBackgroundColor({ color: '#0284c7' });
 }
 
-async function applyAllSettings() {
+// Serialized sync queue prevents race conditions ("Duplicate script ID") on rapid toggle clicks
+let syncChain = Promise.resolve();
+let syncQueued = false;
+
+async function applyAllSettingsNow() {
   const state = await getState();
   await Promise.all([
     syncNetworkHeaders(state),
@@ -320,20 +276,43 @@ async function applyAllSettings() {
   ]);
 }
 
+function scheduleApplyAllSettings() {
+  if (syncQueued) return syncChain;
+  syncQueued = true;
+  syncChain = syncChain
+    .then(async () => {
+      syncQueued = false;
+      await applyAllSettingsNow();
+    })
+    .catch((err) => {
+      syncQueued = false;
+      console.warn('Settings sync error:', err);
+    });
+  return syncChain;
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const current = await chrome.storage.local.get(null);
+  const patch = {};
   if (current.enabled === undefined) {
-    await chrome.storage.local.set(DEFAULT_STATE);
+    Object.assign(patch, DEFAULT_STATE);
+  } else if (current.profileId && resolveProfileId(current.profileId) !== current.profileId) {
+    patch.profileId = resolveProfileId(current.profileId);
   }
-  await applyAllSettings();
+  if (Object.keys(patch).length > 0) {
+    await chrome.storage.local.set(patch);
+  }
+  await scheduleApplyAllSettings();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  applyAllSettings();
+  scheduleApplyAllSettings();
 });
 
-chrome.storage.onChanged.addListener(() => {
-  applyAllSettings();
+chrome.storage.onChanged.addListener((_changes, areaName) => {
+  if (areaName === 'local') {
+    scheduleApplyAllSettings();
+  }
 });
 
 chrome.tabs.onActivated.addListener(async () => {
@@ -350,15 +329,5 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (tab.active) {
       await syncBadge(state);
     }
-  }
-});
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  attachedTabs.delete(tabId);
-});
-
-chrome.debugger.onDetach.addListener((source) => {
-  if (source && source.tabId) {
-    attachedTabs.delete(source.tabId);
   }
 });

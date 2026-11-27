@@ -1,82 +1,12 @@
 'use strict';
 
-const PROFILES = {
-  "us_east": {
-    "id": "us_east",
-    "label": "US East — Atlanta / Ashburn",
-    "tz": "America/New_York",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "us_mountain": {
-    "id": "us_mountain",
-    "label": "US Mountain — Denver",
-    "tz": "America/Denver",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "us_central": {
-    "id": "us_central",
-    "label": "US Central — Chicago / Dallas",
-    "tz": "America/Chicago",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "us_west": {
-    "id": "us_west",
-    "label": "US West — Los Angeles / Seattle",
-    "tz": "America/Los_Angeles",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  },
-  "uk_london": {
-    "id": "uk_london",
-    "label": "UK — London",
-    "tz": "Europe/London",
-    "locale": "en-GB",
-    "languages": [
-      "en-GB",
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-GB,en-US;q=0.9,en;q=0.8"
-  },
-  "eu_central": {
-    "id": "eu_central",
-    "label": "Europe — Frankfurt / Amsterdam",
-    "tz": "Europe/Berlin",
-    "locale": "en-US",
-    "languages": [
-      "en-US",
-      "en"
-    ],
-    "acceptLanguage": "en-US,en;q=0.9"
-  }
-};
-
-const DEFAULT_STATE = {
-  enabled: true,
-  profileId: 'us_east',
-  spoofLang: true,
-  cdpMode: false,
-  excludedSites: []
-};
+const {
+  PROFILE_GROUPS,
+  PROFILE_LIST,
+  DEFAULT_STATE,
+  resolveProfileId,
+  getProfile
+} = window.TZ_PROFILES_DATA;
 
 const elEnabled = document.getElementById('toggleEnabled');
 const elProfile = document.getElementById('profileSelect');
@@ -85,6 +15,7 @@ const elExcludeSite = document.getElementById('toggleExcludeSite');
 const elSiteExcludeCard = document.getElementById('siteExcludeCard');
 const elSiteExcludeRow = document.getElementById('siteExcludeRow');
 const elLang = document.getElementById('toggleLang');
+const elLangHint = document.getElementById('langHint');
 const elCdp = document.getElementById('toggleCdp');
 const elMain = document.getElementById('mainControls');
 const elDot = document.getElementById('statusDot');
@@ -100,6 +31,25 @@ const elReload = document.getElementById('reloadBtn');
 let currentState = Object.assign({}, DEFAULT_STATE);
 let activeTabId = null;
 let activeDomain = null;
+let pendingReload = false;
+
+function populateProfileSelect() {
+  elProfile.textContent = '';
+  for (const grp of PROFILE_GROUPS) {
+    const optgroup = document.createElement('optgroup');
+    optgroup.label = grp.label;
+    const items = PROFILE_LIST.filter((p) => p.group === grp.id);
+    for (const item of items) {
+      const opt = document.createElement('option');
+      opt.value = item.id;
+      opt.textContent = item.optionLabel;
+      optgroup.appendChild(opt);
+    }
+    if (optgroup.children.length > 0) {
+      elProfile.appendChild(optgroup);
+    }
+  }
+}
 
 function normalizeDomain(input) {
   let s = String(input || '').trim().toLowerCase();
@@ -134,7 +84,7 @@ function getMatchedExcludedDomain() {
 }
 
 function updateClockAndSummary() {
-  const profile = PROFILES[currentState.profileId] || PROFILES.us_east;
+  const profile = getProfile(currentState.profileId);
 
   if (!currentState.enabled) {
     elClock.textContent = 'Подмена отключена';
@@ -194,7 +144,9 @@ function renderExcludedChips() {
     btn.title = `Вернуть подмену для ${domain}`;
     btn.textContent = '×';
     btn.addEventListener('click', () => {
-      const next = (currentState.excludedSites || []).filter((d) => normalizeDomain(d) !== normalizeDomain(domain));
+      const next = (currentState.excludedSites || []).filter(
+        (d) => normalizeDomain(d) !== normalizeDomain(domain)
+      );
       saveState({ excludedSites: next });
     });
 
@@ -207,6 +159,8 @@ function renderExcludedChips() {
 function renderUI() {
   const isEnabled = Boolean(currentState.enabled);
   const siteExcluded = isCurrentSiteExcluded();
+  const resolvedId = resolveProfileId(currentState.profileId);
+  const profile = getProfile(resolvedId);
 
   elEnabled.checked = isEnabled;
   elMain.classList.toggle('disabled', !isEnabled);
@@ -215,8 +169,9 @@ function renderUI() {
   elProfileField.classList.toggle('dimmed', isEnabled && siteExcluded);
   elSiteExcludeCard.classList.toggle('active-bypass', isEnabled && siteExcluded);
 
-  elProfile.value = PROFILES[currentState.profileId] ? currentState.profileId : 'us_east';
+  elProfile.value = resolvedId;
   elLang.checked = Boolean(currentState.spoofLang);
+  elLangHint.textContent = `Accept-Language, Intl и голоса (${profile.locale})`;
   elCdp.checked = Boolean(currentState.cdpMode);
 
   if (activeDomain) {
@@ -233,17 +188,31 @@ function renderUI() {
     elDomainHint.textContent = 'Системная вкладка (ниже можно ввести домен)';
   }
 
+  if (pendingReload && activeDomain) {
+    elReload.classList.add('needs-reload');
+    elReload.textContent = '↻ Обновить вкладку';
+  } else {
+    elReload.classList.remove('needs-reload');
+    elReload.textContent = 'Обновить вкладку';
+  }
+
   renderExcludedChips();
   updateClockAndSummary();
 }
 
 async function saveState(patch) {
   currentState = Object.assign({}, currentState, patch);
+  currentState.profileId = resolveProfileId(currentState.profileId);
+  if (activeDomain) {
+    pendingReload = true;
+  }
   await chrome.storage.local.set(currentState);
   renderUI();
 }
 
 async function init() {
+  populateProfileSelect();
+
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab && tab.id) {
     activeTabId = tab.id;
@@ -257,9 +226,11 @@ async function init() {
 
   const stored = await chrome.storage.local.get(DEFAULT_STATE);
   currentState = Object.assign({}, DEFAULT_STATE, stored);
+  currentState.profileId = resolveProfileId(currentState.profileId);
   if (!Array.isArray(currentState.excludedSites)) {
     currentState.excludedSites = [];
   }
+
   renderUI();
   setInterval(updateClockAndSummary, 1000);
 }
@@ -309,6 +280,7 @@ elCdp.addEventListener('change', () => {
 
 elReload.addEventListener('click', () => {
   if (activeTabId) {
+    pendingReload = false;
     chrome.tabs.reload(activeTabId);
     window.close();
   }

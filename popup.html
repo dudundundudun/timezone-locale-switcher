@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>Zone & Locale</title>
+  <title>Zone &amp; Locale</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -14,7 +14,7 @@
         <div>
           <div class="title-row">
             <h1 class="title">Zone &amp; Locale</h1>
-            <span class="ver-badge">v1.3</span>
+            <span class="ver-badge">v1.4</span>
           </div>
           <p class="subtitle" id="liveClock">--:-- · UTC</p>
         </div>
@@ -41,18 +41,11 @@
         </label>
       </div>
 
-      <!-- Profile Dropdown -->
+      <!-- Profile Dropdown (populated from profiles-data.js) -->
       <div class="field" id="profileField">
-        <label class="field-label" for="profileSelect">Активный профиль</label>
+        <label class="field-label" for="profileSelect">Активный сервер / регион</label>
         <div class="select-wrap">
-          <select id="profileSelect">
-            <option value="us_east">🇺🇸 US East — Atlanta / Ashburn</option>
-            <option value="us_mountain">🇺🇸 US Mountain — Denver</option>
-            <option value="us_central">🇺🇸 US Central — Chicago / Dallas</option>
-            <option value="us_west">🇺🇸 US West — Los Angeles / Seattle</option>
-            <option value="uk_london">🇬🇧 UK — London</option>
-            <option value="eu_central">🇪🇺 Europe — Frankfurt / Amsterdam</option>
-          </select>
+          <select id="profileSelect"></select>
         </div>
       </div>
 
@@ -61,7 +54,7 @@
         <label class="toggle-row">
           <div class="toggle-text">
             <span class="toggle-title">Английский язык браузера</span>
-            <span class="toggle-hint">Accept-Language, Intl и голоса (en-US)</span>
+            <span class="toggle-hint" id="langHint">Accept-Language, Intl и голоса (en-US)</span>
           </div>
           <span class="switch switch-sm">
             <input type="checkbox" id="toggleLang" checked>
@@ -94,10 +87,11 @@
 
     <!-- Quiet Status Footer -->
     <footer class="footer">
-      <span id="tzSummary">America/New_York · en-US</span>
+      <span class="tz-summary" id="tzSummary">America/New_York · en-US</span>
       <button type="button" class="reload-btn" id="reloadBtn" title="Обновить текущую вкладку">Обновить вкладку</button>
     </footer>
   </div>
+  <script src="profiles-data.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
