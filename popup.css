@@ -5,7 +5,7 @@
 }
 
 body {
-  width: 336px;
+  width: 344px;
   background: #0f1218;
   color: #e2e8f0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
@@ -16,10 +16,10 @@ body {
 }
 
 .card {
-  padding: 15px 16px;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 11px;
 }
 
 /* Header */
@@ -27,7 +27,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding-bottom: 11px;
+  padding-bottom: 10px;
   border-bottom: 1px solid #1e2430;
 }
 
@@ -44,6 +44,11 @@ body {
   background: #38bdf8;
   box-shadow: 0 0 8px rgba(56, 189, 248, 0.55);
   transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.status-dot.cdp {
+  background: #2dd4bf;
+  box-shadow: 0 0 8px rgba(45, 212, 191, 0.55);
 }
 
 .status-dot.bypass {
@@ -64,7 +69,7 @@ body {
 .title-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
 
 .title {
@@ -83,6 +88,23 @@ body {
   border-radius: 4px;
 }
 
+.engine-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #94a3b8;
+  background: #1a2230;
+  border: 1px solid #2a3548;
+  padding: 0 5px;
+  border-radius: 4px;
+}
+
+.engine-badge.cdp-on {
+  color: #2dd4bf;
+  background: rgba(20, 184, 166, 0.14);
+  border-color: rgba(45, 212, 191, 0.35);
+}
+
 .subtitle {
   font-size: 11.5px;
   color: #94a3b8;
@@ -94,7 +116,7 @@ body {
 .main {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 11px;
   transition: opacity 0.2s ease;
 }
 
@@ -120,7 +142,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 12px;
+  padding: 9px 12px;
   cursor: pointer;
   gap: 10px;
 }
@@ -173,7 +195,7 @@ select {
   border: 1px solid #262f3f;
   border-radius: 8px;
   padding: 8px 30px 8px 11px;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
   outline: none;
   cursor: pointer;
@@ -190,7 +212,7 @@ select optgroup {
 select option {
   background: #161b24;
   color: #f1f5f9;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 400;
 }
 
@@ -217,7 +239,7 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 9px 12px;
+  padding: 8px 12px;
   cursor: pointer;
   gap: 10px;
 }
@@ -227,7 +249,7 @@ select:focus {
 }
 
 .toggle-row.vpn-exposed {
-  background: rgba(220, 38, 38, 0.11);
+  background: rgba(220, 38, 38, 0.12);
 }
 
 .toggle-row + .toggle-row {
@@ -281,6 +303,7 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  min-width: 0;
 }
 
 .toggle-title {
@@ -292,7 +315,7 @@ select:focus {
 .toggle-hint {
   font-size: 11px;
   color: #64748b;
-  max-width: 210px;
+  max-width: 228px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -300,6 +323,10 @@ select:focus {
 
 .toggle-hint.hint-ok {
   color: #38bdf8;
+}
+
+.toggle-hint.hint-warn {
+  color: #fbbf24;
 }
 
 .toggle-hint.hint-danger {
@@ -359,6 +386,10 @@ input:checked + .slider {
 
 .switch-warn input:checked + .slider {
   background-color: #d97706;
+}
+
+.switch-teal input:checked + .slider {
+  background-color: #0d9488;
 }
 
 input:checked + .slider::before {
@@ -422,7 +453,7 @@ input:checked + .slider::before {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
-  max-height: 60px;
+  max-height: 58px;
   overflow-y: auto;
 }
 

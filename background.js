@@ -5,14 +5,30 @@ importScripts('profiles-data.js');
 const {
   DEFAULT_STATE,
   DEFAULT_VPN_STATUS,
+  isValidTimeZone,
   resolveProfileId,
   getProfile,
-  matchProfileFromGeo
+  resolveGeoConsensus
 } = self.TZ_PROFILES_DATA;
 
 const DNR_RULE_ID = 1001;
+const CONTENT_SCRIPT_ID = 'tz_global_main';
 const VPN_WATCHDOG_ALARM = 'tz_vpn_watchdog';
-const SETTING_KEYS = ['enabled', 'profileId', 'autoVpn', 'spoofLang', 'cdpMode', 'excludedSites'];
+const SETTING_KEYS = [
+  'enabled',
+  'profileId',
+  'autoVpn',
+  'leakAlert',
+  'spoofLang',
+  'cdpMode',
+  'excludedSites'
+];
+
+// In-memory state cache for zero-latency CDP attachment on tab creation / target spawn
+let cachedState = null;
+// Track flattened child CDP sessions (OOPIF iframes like challenges.cloudflare.com + Web Workers)
+const tabChildSessions = new Map();
+let cachedUaPayloadPromise = null;
 
 function normalizeDomain(host) {
   let s = String(host || '').trim().toLowerCase();
@@ -42,12 +58,19 @@ function isUrlExcluded(urlStr, excludedSites) {
   }
 }
 
+function isHttpUrl(urlStr) {
+  return Boolean(urlStr && (urlStr.startsWith('http://') || urlStr.startsWith('https://')));
+}
+
 async function getState() {
   const keysToRead = Object.assign({}, DEFAULT_STATE, { vpnStatus: DEFAULT_VPN_STATUS });
   const data = await chrome.storage.local.get(keysToRead);
   const state = Object.assign({}, DEFAULT_STATE, data);
   state.profileId = resolveProfileId(state.profileId);
   state.autoVpn = Boolean(state.autoVpn);
+  state.leakAlert = state.leakAlert !== undefined ? Boolean(state.leakAlert) : true;
+  state.spoofLang = Boolean(state.spoofLang);
+  state.cdpMode = Boolean(state.cdpMode);
   if (!Array.isArray(state.excludedSites)) {
     state.excludedSites = [];
   }
@@ -55,7 +78,69 @@ async function getState() {
     new Set(state.excludedSites.map(normalizeDomain).filter(Boolean))
   );
   state.vpnStatus = Object.assign({}, DEFAULT_VPN_STATUS, data.vpnStatus || {});
+  cachedState = state;
   return state;
+}
+
+function getEffectiveTimezone(state) {
+  if (
+    state.autoVpn &&
+    state.vpnStatus &&
+    !state.vpnStatus.exposed &&
+    isValidTimeZone(state.vpnStatus.timezone)
+  ) {
+    return state.vpnStatus.timezone;
+  }
+  return getProfile(state.profileId).tz;
+}
+
+function isWatchdogActive(state) {
+  return Boolean(state.enabled && (state.autoVpn || state.leakAlert));
+}
+
+// Read genuine Chrome UA + Windows 11 High-Entropy Client Hints once so CDP setUserAgentOverride
+// never strips platformVersion, bitness, architecture, or fullVersionList
+function getNativeUaPayload() {
+  if (cachedUaPayloadPromise) return cachedUaPayloadPromise;
+  cachedUaPayloadPromise = (async () => {
+    const userAgent = (self.navigator && self.navigator.userAgent) || '';
+    const platform = (self.navigator && self.navigator.platform) || '';
+    let userAgentMetadata = null;
+    try {
+      const uad = self.navigator && self.navigator.userAgentData;
+      if (uad && typeof uad.getHighEntropyValues === 'function') {
+        const he = await uad.getHighEntropyValues([
+          'architecture',
+          'bitness',
+          'brands',
+          'fullVersionList',
+          'mobile',
+          'model',
+          'platform',
+          'platformVersion',
+          'wow64'
+        ]);
+        const brands = Array.isArray(he.brands) ? he.brands : (Array.isArray(uad.brands) ? uad.brands : []);
+        if (brands.length > 0 && he.platform) {
+          userAgentMetadata = {
+            brands: brands.map((b) => ({ brand: String(b.brand), version: String(b.version) })),
+            fullVersionList: Array.isArray(he.fullVersionList)
+              ? he.fullVersionList.map((b) => ({ brand: String(b.brand), version: String(b.version) }))
+              : undefined,
+            platform: String(he.platform || ''),
+            platformVersion: String(he.platformVersion || ''),
+            architecture: String(he.architecture || ''),
+            model: String(he.model || ''),
+            mobile: Boolean(he.mobile),
+            bitness: he.bitness ? String(he.bitness) : undefined,
+            wow64: typeof he.wow64 === 'boolean' ? he.wow64 : undefined
+          };
+        }
+      }
+    } catch (_) {}
+    return { userAgent, platform, userAgentMetadata };
+  })();
+  return cachedUaPayloadPromise;
 }
 
 // 1. Update Accept-Language HTTP Header via declarativeNetRequest across ALL resource types (including WebSocket)
@@ -71,7 +156,7 @@ async function syncNetworkHeaders(state) {
     const profile = getProfile(state.profileId);
     const condition = {
       urlFilter: '*',
-      excludedResourceTypes: [] // Matches ALL resource types including main_frame, websocket, media, xmlhttprequest, etc.
+      excludedResourceTypes: []
     };
 
     if (state.excludedSites.length > 0) {
@@ -104,22 +189,38 @@ async function syncNetworkHeaders(state) {
   }
 }
 
-// 2. Register synchronous MAIN world scripts at document_start (excluding excludedSites)
+function arraysEqual(a, b) {
+  const arrA = Array.isArray(a) ? a : [];
+  const arrB = Array.isArray(b) ? b : [];
+  if (arrA.length !== arrB.length) return false;
+  for (let i = 0; i < arrA.length; i++) {
+    if (arrA[i] !== arrB[i]) return false;
+  }
+  return true;
+}
+
+// 2. Atomic MAIN world content script registration (skipped completely in Zero-JS CDP Mode!)
 async function syncContentScripts(state) {
   try {
     const existing = await chrome.scripting.getRegisteredContentScripts();
-    if (existing.length > 0) {
-      await chrome.scripting.unregisterContentScripts({
-        ids: existing.map((s) => s.id)
-      });
+    const hasMain = existing.some((s) => s.id === CONTENT_SCRIPT_ID);
+    const staleIds = existing.filter((s) => s.id !== CONTENT_SCRIPT_ID).map((s) => s.id);
+    if (staleIds.length > 0) {
+      await chrome.scripting.unregisterContentScripts({ ids: staleIds });
     }
 
-    if (!state.enabled) {
+    // In CDP mode, C++ engine overrides handle Date, Intl, Temporal, and Navigator natively
+    // across frames & workers — do NOT inject JS monkey-patches on top!
+    if (!state.enabled || state.cdpMode) {
+      if (hasMain) {
+        await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] });
+      }
       return;
     }
 
     const profileId = resolveProfileId(state.profileId);
     const langFile = state.spoofLang ? 'profiles/_lang_on.js' : 'profiles/_lang_off.js';
+    const desiredJs = [`profiles/${profileId}.js`, langFile, 'inject.js'];
 
     const excludeMatches = [];
     for (const domain of state.excludedSites) {
@@ -128,26 +229,42 @@ async function syncContentScripts(state) {
     }
 
     const globalRule = {
-      id: 'tz_global_main',
+      id: CONTENT_SCRIPT_ID,
       matches: ['<all_urls>'],
-      js: [`profiles/${profileId}.js`, langFile, 'inject.js'],
+      js: desiredJs,
       runAt: 'document_start',
       world: 'MAIN',
       allFrames: true,
-      matchOriginAsFallback: true
+      matchOriginAsFallback: true,
+      persistAcrossSessions: true
     };
 
     if (excludeMatches.length > 0) {
       globalRule.excludeMatches = excludeMatches;
+    } else {
+      globalRule.excludeMatches = [];
     }
 
-    await chrome.scripting.registerContentScripts([globalRule]);
+    if (hasMain) {
+      const cur = existing.find((s) => s.id === CONTENT_SCRIPT_ID);
+      if (
+        cur &&
+        arraysEqual(cur.js, desiredJs) &&
+        arraysEqual(cur.excludeMatches || [], excludeMatches)
+      ) {
+        return;
+      }
+      // Atomic update without unregistration gap during startup tab restoration
+      await chrome.scripting.updateContentScripts([globalRule]);
+    } else {
+      await chrome.scripting.registerContentScripts([globalRule]);
+    }
   } catch (err) {
     console.warn('ContentScript sync error:', err);
   }
 }
 
-// 3. Optional CDP Engine Mode (queries real Chrome debugger targets so Service Worker sleep never loses state)
+// 3. Pure Engine-Level CDP Mode (with OOPIF iframe + Web Worker auto-attach & zero Runtime/Network hooks)
 async function getExtensionAttachedTabIds() {
   if (!chrome.debugger || typeof chrome.debugger.getTargets !== 'function') {
     return new Set();
@@ -167,7 +284,66 @@ async function getExtensionAttachedTabIds() {
   }
 }
 
+function recordChildSession(tabId, sessionId) {
+  if (typeof tabId !== 'number' || !sessionId) return;
+  let set = tabChildSessions.get(tabId);
+  if (!set) {
+    set = new Set();
+    tabChildSessions.set(tabId, set);
+  }
+  set.add(sessionId);
+}
+
+function removeChildSession(tabId, sessionId) {
+  const set = tabChildSessions.get(tabId);
+  if (!set) return;
+  if (sessionId) {
+    set.delete(sessionId);
+    if (set.size === 0) tabChildSessions.delete(tabId);
+  } else {
+    tabChildSessions.delete(tabId);
+  }
+}
+
+async function applyOverridesToCdpTarget(debuggee, state, uaPayload) {
+  const profile = getProfile(state.profileId);
+  const tz = getEffectiveTimezone(state);
+
+  await chrome.debugger.sendCommand(debuggee, 'Emulation.setTimezoneOverride', {
+    timezoneId: tz
+  }).catch(() => {});
+
+  if (state.spoofLang) {
+    await chrome.debugger.sendCommand(debuggee, 'Emulation.setLocaleOverride', {
+      locale: profile.locale
+    }).catch(() => {});
+
+    if (uaPayload && uaPayload.userAgent) {
+      // Pass comma-separated language tags WITHOUT ';q=0.9' so Chromium sets clean navigator.languages
+      const uaOverride = {
+        userAgent: uaPayload.userAgent,
+        acceptLanguage: profile.languages.join(',')
+      };
+      if (uaPayload.platform) {
+        uaOverride.platform = uaPayload.platform;
+      }
+      if (uaPayload.userAgentMetadata) {
+        uaOverride.userAgentMetadata = uaPayload.userAgentMetadata;
+      }
+      await chrome.debugger.sendCommand(debuggee, 'Emulation.setUserAgentOverride', uaOverride).catch(() => {});
+    }
+  } else {
+    await chrome.debugger.sendCommand(debuggee, 'Emulation.setLocaleOverride', {
+      locale: ''
+    }).catch(() => {});
+    await chrome.debugger.sendCommand(debuggee, 'Emulation.setUserAgentOverride', {
+      userAgent: ''
+    }).catch(() => {});
+  }
+}
+
 async function detachCdpFromTab(tabId, attachedSet) {
+  removeChildSession(tabId);
   const known = attachedSet || await getExtensionAttachedTabIds();
   if (!known.has(tabId)) return;
   try {
@@ -178,21 +354,13 @@ async function detachCdpFromTab(tabId, attachedSet) {
 async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
   const known = attachedSet || await getExtensionAttachedTabIds();
 
-  if (!state.enabled || !state.cdpMode) {
-    await detachCdpFromTab(tabId, known);
-    return;
-  }
-  if (!urlStr || (!urlStr.startsWith('http://') && !urlStr.startsWith('https://'))) {
-    await detachCdpFromTab(tabId, known);
-    return;
-  }
-  if (isUrlExcluded(urlStr, state.excludedSites)) {
+  if (!state.enabled || !state.cdpMode || !isHttpUrl(urlStr) || isUrlExcluded(urlStr, state.excludedSites)) {
     await detachCdpFromTab(tabId, known);
     return;
   }
 
-  const profile = getProfile(state.profileId);
   const target = { tabId };
+  const uaPayload = await getNativeUaPayload();
 
   try {
     if (!known.has(tabId)) {
@@ -200,30 +368,30 @@ async function applyCdpToTab(tabId, urlStr, state, attachedSet) {
       known.add(tabId);
     }
 
-    await chrome.debugger.sendCommand(target, 'Emulation.setTimezoneOverride', {
-      timezoneId: profile.tz
-    });
+    await applyOverridesToCdpTarget(target, state, uaPayload);
 
-    await chrome.debugger.sendCommand(target, 'Network.enable', {});
-    if (state.spoofLang) {
-      await chrome.debugger.sendCommand(target, 'Emulation.setLocaleOverride', {
-        locale: profile.locale
-      });
-      await chrome.debugger.sendCommand(target, 'Network.setExtraHTTPHeaders', {
-        headers: { 'Accept-Language': profile.acceptLanguage }
-      });
-    } else {
-      await chrome.debugger.sendCommand(target, 'Emulation.setLocaleOverride', {
-        locale: ''
-      });
-      await chrome.debugger.sendCommand(target, 'Network.setExtraHTTPHeaders', {
-        headers: {}
-      });
+    // Auto-attach to out-of-process cross-origin iframes (e.g. challenges.cloudflare.com)
+    // and Dedicated/Shared/Service Workers BEFORE their first script instruction runs
+    await chrome.debugger.sendCommand(target, 'Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: true,
+      flatten: true
+    }).catch(() => {});
+
+    // Also refresh any already-attached child sessions on this tab
+    const children = tabChildSessions.get(tabId);
+    if (children && children.size > 0) {
+      await Promise.all(
+        Array.from(children).map((sessionId) =>
+          applyOverridesToCdpTarget({ tabId, sessionId }, state, uaPayload)
+        )
+      );
     }
   } catch (_) {}
 }
 
 async function detachAllCdp() {
+  tabChildSessions.clear();
   const attached = await getExtensionAttachedTabIds();
   await Promise.all(
     Array.from(attached).map(async (tabId) => {
@@ -244,14 +412,52 @@ async function syncCdpMode(state) {
     getExtensionAttachedTabIds()
   ]);
 
-  for (const tab of tabs) {
-    if (tab.id) {
-      await applyCdpToTab(tab.id, tab.url || '', state, attached);
-    }
-  }
+  await Promise.all(
+    tabs.map((tab) => {
+      if (!tab.id) return Promise.resolve();
+      const targetUrl = tab.pendingUrl || tab.url || '';
+      return applyCdpToTab(tab.id, targetUrl, state, attached);
+    })
+  );
 }
 
-// 4. Badge indicator (shows SYS on excluded sites, red RU! on VPN drop, or active region code)
+if (chrome.debugger && chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener(async (source, method, params) => {
+    if (!source || typeof source.tabId !== 'number') return;
+
+    if (method === 'Target.attachedToTarget') {
+      const sessionId = params && params.sessionId;
+      if (!sessionId) return;
+      recordChildSession(source.tabId, sessionId);
+      const childTarget = { tabId: source.tabId, sessionId };
+      try {
+        const state = cachedState || await getState();
+        if (state.enabled && state.cdpMode) {
+          const uaPayload = await getNativeUaPayload();
+          await applyOverridesToCdpTarget(childTarget, state, uaPayload);
+        }
+      } catch (_) {
+      } finally {
+        // Always resume paused child target so OOPIF / Worker never stalls
+        await chrome.debugger.sendCommand(childTarget, 'Runtime.runIfWaitingForDebugger', {}).catch(() => {});
+      }
+    } else if (method === 'Target.detachedFromTarget') {
+      if (params && params.sessionId) {
+        removeChildSession(source.tabId, params.sessionId);
+      }
+    }
+  });
+}
+
+if (chrome.debugger && chrome.debugger.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source && typeof source.tabId === 'number') {
+      removeChildSession(source.tabId);
+    }
+  });
+}
+
+// 4. Badge indicator (shows SYS on excluded sites, red RU! on VPN drop even in manual mode, or active region)
 async function syncBadge(state) {
   if (!state.enabled) {
     await chrome.action.setBadgeText({ text: 'OFF' });
@@ -261,14 +467,15 @@ async function syncBadge(state) {
 
   try {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (activeTab && activeTab.url && isUrlExcluded(activeTab.url, state.excludedSites)) {
+    const tabUrl = activeTab && (activeTab.pendingUrl || activeTab.url);
+    if (tabUrl && isUrlExcluded(tabUrl, state.excludedSites)) {
       await chrome.action.setBadgeText({ text: 'SYS' });
       await chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
       return;
     }
   } catch (_) {}
 
-  if (state.autoVpn && state.vpnStatus && state.vpnStatus.exposed) {
+  if (isWatchdogActive(state) && state.vpnStatus && state.vpnStatus.exposed) {
     await chrome.action.setBadgeText({ text: 'RU!' });
     await chrome.action.setBadgeBackgroundColor({ color: '#dc2626' });
     return;
@@ -276,23 +483,11 @@ async function syncBadge(state) {
 
   const profile = getProfile(state.profileId);
   await chrome.action.setBadgeText({ text: profile.badge || 'ON' });
-  await chrome.action.setBadgeBackgroundColor({ color: '#0284c7' });
+  await chrome.action.setBadgeBackgroundColor({ color: state.cdpMode ? '#0d9488' : '#0284c7' });
 }
 
-// 5. Auto-VPN GeoIP Watchdog & Network-Change Detector
+// 5. Cloudflare-Synchronized GeoIP Consensus & Independent RU! Watchdog
 const GEO_PROVIDERS = [
-  {
-    url: 'https://get.geojs.io/v1/ip/geo.json',
-    parse(d) {
-      if (!d || (!d.country_code && !d.timezone)) return null;
-      return {
-        ip: String(d.ip || ''),
-        countryCode: String(d.country_code || '').toUpperCase(),
-        city: String(d.city || d.region || ''),
-        timezone: String(d.timezone || '')
-      };
-    }
-  },
   {
     url: 'https://ipwho.is/?output=json',
     parse(d) {
@@ -303,7 +498,8 @@ const GEO_PROVIDERS = [
         ip: String(d.ip || ''),
         countryCode: String(d.country_code || '').toUpperCase(),
         city: String(d.city || d.region || ''),
-        timezone: String(tz || '')
+        timezone: String(tz || ''),
+        lowAccuracy: !d.city && !d.region
       };
     }
   },
@@ -315,13 +511,37 @@ const GEO_PROVIDERS = [
         ip: String(d.ip || ''),
         countryCode: String(d.country_code || '').toUpperCase(),
         city: String(d.city || d.region || ''),
-        timezone: String(d.timezone || '')
+        timezone: String(d.timezone || ''),
+        lowAccuracy: !d.city && !d.region
+      };
+    }
+  },
+  {
+    url: 'https://get.geojs.io/v1/ip/geo.json',
+    parse(d) {
+      if (!d || (!d.country_code && !d.timezone)) return null;
+      const cc = String(d.country_code || '').toUpperCase();
+      const city = String(d.city || d.region || '');
+      const acc = Number(d.accuracy || 0);
+      // MaxMind GeoLite2 country-centroid fallback has accuracy >= 500km (e.g. Kansas America/Chicago for US)
+      const lowAccuracy = acc >= 500 || !city;
+      return {
+        ip: String(d.ip || ''),
+        countryCode: cc,
+        city,
+        timezone: String(d.timezone || ''),
+        lowAccuracy
       };
     }
   }
 ];
 
-async function fetchJsonNoStore(url, timeoutMs = 4500) {
+const CF_TRACE_URLS = [
+  'https://www.cloudflare.com/cdn-cgi/trace',
+  'https://1.1.1.1/cdn-cgi/trace'
+];
+
+async function fetchWithTimeout(url, acceptHeader, timeoutMs = 4000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -329,11 +549,11 @@ async function fetchJsonNoStore(url, timeoutMs = 4500) {
       method: 'GET',
       cache: 'no-store',
       credentials: 'omit',
-      headers: { Accept: 'application/json' },
+      headers: acceptHeader ? { Accept: acceptHeader } : undefined,
       signal: ctrl.signal
     });
     if (!res.ok) return null;
-    return await res.json();
+    return res;
   } catch (_) {
     return null;
   } finally {
@@ -343,11 +563,45 @@ async function fetchJsonNoStore(url, timeoutMs = 4500) {
 
 async function fetchGeoIpInfo() {
   for (const provider of GEO_PROVIDERS) {
-    const raw = await fetchJsonNoStore(provider.url);
-    const parsed = raw ? provider.parse(raw) : null;
-    if (parsed && (parsed.countryCode || parsed.timezone)) {
-      return parsed;
+    const res = await fetchWithTimeout(provider.url, 'application/json', 4200);
+    if (!res) continue;
+    try {
+      const raw = await res.json();
+      const parsed = raw ? provider.parse(raw) : null;
+      if (parsed && (parsed.countryCode || parsed.timezone)) {
+        return parsed;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+function parseCfTraceText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const map = Object.create(null);
+  for (const line of text.split('\n')) {
+    const idx = line.indexOf('=');
+    if (idx > 0) {
+      map[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
     }
+  }
+  if (!map.ip && !map.loc && !map.colo) return null;
+  return {
+    ip: map.ip || '',
+    countryCode: (map.loc || '').toUpperCase(),
+    colo: (map.colo || '').toUpperCase()
+  };
+}
+
+async function fetchCloudflareTrace() {
+  for (const url of CF_TRACE_URLS) {
+    const res = await fetchWithTimeout(url, 'text/plain', 3500);
+    if (!res) continue;
+    try {
+      const txt = await res.text();
+      const parsed = parseCfTraceText(txt);
+      if (parsed) return parsed;
+    } catch (_) {}
   }
   return null;
 }
@@ -360,30 +614,37 @@ async function checkVpnLocation(force = false) {
   inFlightVpnCheck = (async () => {
     try {
       const initialState = await getState();
-      if (!force && (!initialState.enabled || !initialState.autoVpn)) {
+      if (!force && !isWatchdogActive(initialState)) {
         return { ok: false, skipped: true };
       }
 
-      const geo = await fetchGeoIpInfo();
-      const latestState = await getState();
+      // Query JSON GeoIP & Cloudflare's own edge in parallel so timezone always matches Cloudflare
+      const [jsonGeo, cfTrace] = await Promise.all([
+        fetchGeoIpInfo(),
+        fetchCloudflareTrace()
+      ]);
 
-      if (!geo) {
+      const latestState = await getState();
+      const consensus = resolveGeoConsensus(jsonGeo, cfTrace);
+
+      if (!consensus) {
         const errStatus = Object.assign({}, latestState.vpnStatus, {
           checkedAt: Date.now(),
-          error: 'Нет ответа от GeoIP'
+          error: 'Нет ответа от GeoIP / Cloudflare'
         });
         await chrome.storage.local.set({ vpnStatus: errStatus });
         return { ok: false, vpnStatus: errStatus };
       }
 
-      const match = matchProfileFromGeo(geo.countryCode, geo.timezone);
       const nextVpnStatus = {
-        ip: geo.ip,
-        countryCode: geo.countryCode,
-        city: geo.city,
-        timezone: geo.timezone,
-        matchedProfileId: match.profileId || '',
-        exposed: Boolean(match.exposed),
+        ip: consensus.ip,
+        countryCode: consensus.countryCode,
+        city: consensus.city,
+        timezone: consensus.timezone,
+        colo: consensus.colo,
+        splitIp: Boolean(consensus.splitIp),
+        matchedProfileId: consensus.matchedProfileId || '',
+        exposed: Boolean(consensus.exposed),
         checkedAt: Date.now(),
         error: ''
       };
@@ -394,12 +655,12 @@ async function checkVpnLocation(force = false) {
       if (
         latestState.enabled &&
         latestState.autoVpn &&
-        !match.exposed &&
-        match.profileId &&
-        match.profileId !== latestState.profileId
+        !consensus.exposed &&
+        consensus.matchedProfileId &&
+        consensus.matchedProfileId !== latestState.profileId
       ) {
-        patch.profileId = match.profileId;
-        switchedTo = match.profileId;
+        patch.profileId = consensus.matchedProfileId;
+        switchedTo = consensus.matchedProfileId;
       }
 
       await chrome.storage.local.set(patch);
@@ -419,7 +680,6 @@ function onNetworkChanged() {
   if (netDebounceFast) clearTimeout(netDebounceFast);
   if (netDebounceVerify) clearTimeout(netDebounceVerify);
 
-  // Fast probe once VPN route settles (~900ms), plus verification probe (~3.8s) for Hysteria2/LTE handshakes
   netDebounceFast = setTimeout(() => {
     checkVpnLocation(false).catch(() => {});
   }, 900);
@@ -431,7 +691,7 @@ function onNetworkChanged() {
 async function syncVpnWatchdogAlarm(state) {
   if (!chrome.alarms) return;
   try {
-    if (state.enabled && state.autoVpn) {
+    if (isWatchdogActive(state)) {
       const existing = await chrome.alarms.get(VPN_WATCHDOG_ALARM);
       if (!existing) {
         chrome.alarms.create(VPN_WATCHDOG_ALARM, { periodInMinutes: 2 });
@@ -442,7 +702,6 @@ async function syncVpnWatchdogAlarm(state) {
   } catch (_) {}
 }
 
-// Serialized sync queue prevents race conditions ("Duplicate script ID") on rapid toggle clicks
 let syncChain = Promise.resolve();
 let syncQueued = false;
 
@@ -471,6 +730,10 @@ function scheduleApplyAllSettings() {
     });
   return syncChain;
 }
+
+// Warm up state & UA metadata immediately on Service Worker boot
+getState().catch(() => {});
+getNativeUaPayload().catch(() => {});
 
 if (self.navigator && self.navigator.connection && typeof self.navigator.connection.addEventListener === 'function') {
   self.navigator.connection.addEventListener('change', onNetworkChanged);
@@ -507,6 +770,9 @@ chrome.runtime.onInstalled.addListener(async () => {
     if (current.autoVpn === undefined) {
       patch.autoVpn = true;
     }
+    if (current.leakAlert === undefined) {
+      patch.leakAlert = true;
+    }
   }
   if (Object.keys(patch).length > 0) {
     await chrome.storage.local.set(patch);
@@ -525,26 +791,48 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   const settingsChanged = SETTING_KEYS.some((k) => k in changes);
   if (settingsChanged) {
     scheduleApplyAllSettings();
-    if ('autoVpn' in changes && changes.autoVpn.newValue === true) {
+    if (
+      ('autoVpn' in changes && changes.autoVpn.newValue === true) ||
+      ('leakAlert' in changes && changes.leakAlert.newValue === true)
+    ) {
       checkVpnLocation(false).catch(() => {});
     }
   } else if ('vpnStatus' in changes) {
-    getState().then(syncBadge).catch(() => {});
+    getState()
+      .then(async (state) => {
+        await syncBadge(state);
+        // If CDP mode is active and exact GeoIP timezone changed within same profile, refresh CDP tabs
+        if (state.enabled && state.cdpMode && state.autoVpn) {
+          await syncCdpMode(state);
+        }
+      })
+      .catch(() => {});
+  }
+});
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (!tab || !tab.id) return;
+  const url = tab.pendingUrl || tab.url || '';
+  if (!url) return;
+  const state = cachedState || await getState();
+  if (state.enabled && state.cdpMode && isHttpUrl(url)) {
+    await applyCdpToTab(tab.id, url, state);
   }
 });
 
 chrome.tabs.onActivated.addListener(async () => {
-  const state = await getState();
+  const state = cachedState || await getState();
   await syncBadge(state);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'loading' && tab.url) {
-    const state = await getState();
+  const url = changeInfo.url || (tab && (tab.pendingUrl || tab.url)) || '';
+  if ((changeInfo.status === 'loading' || changeInfo.url) && url) {
+    const state = cachedState || await getState();
     if (state.enabled && state.cdpMode) {
-      await applyCdpToTab(tabId, tab.url, state);
+      await applyCdpToTab(tabId, url, state);
     }
-    if (tab.active) {
+    if (tab && tab.active) {
       await syncBadge(state);
     }
   }

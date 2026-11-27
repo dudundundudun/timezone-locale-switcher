@@ -5,11 +5,13 @@ const {
   PROFILE_LIST,
   DEFAULT_STATE,
   DEFAULT_VPN_STATUS,
+  isValidTimeZone,
   resolveProfileId,
   getProfile
 } = window.TZ_PROFILES_DATA;
 
 const elEnabled = document.getElementById('toggleEnabled');
+const elEngineBadge = document.getElementById('engineBadge');
 const elProfile = document.getElementById('profileSelect');
 const elProfileField = document.getElementById('profileField');
 const elExcludeSite = document.getElementById('toggleExcludeSite');
@@ -19,9 +21,13 @@ const elAutoVpn = document.getElementById('toggleAutoVpn');
 const elAutoVpnRow = document.getElementById('autoVpnRow');
 const elVpnStatusHint = document.getElementById('vpnStatusHint');
 const elCheckVpnBtn = document.getElementById('checkVpnBtn');
+const elLeakAlert = document.getElementById('toggleLeakAlert');
+const elLeakAlertRow = document.getElementById('leakAlertRow');
+const elLeakAlertHint = document.getElementById('leakAlertHint');
 const elLang = document.getElementById('toggleLang');
 const elLangHint = document.getElementById('langHint');
 const elCdp = document.getElementById('toggleCdp');
+const elCdpHint = document.getElementById('cdpHint');
 const elMain = document.getElementById('mainControls');
 const elDot = document.getElementById('statusDot');
 const elClock = document.getElementById('liveClock');
@@ -90,23 +96,67 @@ function getMatchedExcludedDomain() {
   return null;
 }
 
+function getActiveDisplayTz() {
+  const profile = getProfile(currentState.profileId);
+  if (
+    currentState.autoVpn &&
+    currentState.cdpMode &&
+    !currentVpnStatus.exposed &&
+    isValidTimeZone(currentVpnStatus.timezone)
+  ) {
+    return currentVpnStatus.timezone;
+  }
+  return profile.tz;
+}
+
 function renderVpnStatus() {
-  elVpnStatusHint.classList.remove('hint-ok', 'hint-danger');
+  elVpnStatusHint.classList.remove('hint-ok', 'hint-warn', 'hint-danger');
   elAutoVpnRow.classList.remove('vpn-exposed');
+  elLeakAlertRow.classList.remove('vpn-exposed');
+  elLeakAlertHint.classList.remove('hint-danger');
   elCheckVpnBtn.classList.toggle('spinning', checkingVpn);
 
+  const watchdogOn = Boolean(currentState.autoVpn || currentState.leakAlert);
+
+  if (watchdogOn && currentVpnStatus.exposed) {
+    const loc = currentVpnStatus.city
+      ? `${currentVpnStatus.countryCode || 'RU'} · ${currentVpnStatus.city}`
+      : (currentVpnStatus.countryCode || 'RU');
+    const warnMsg = `⚠️ Виден IP ${loc} (VPN выключен?)`;
+    elLeakAlertRow.classList.add('vpn-exposed');
+    elLeakAlertHint.classList.add('hint-danger');
+    elLeakAlertHint.textContent = warnMsg;
+    elLeakAlertHint.title = warnMsg;
+  } else {
+    elLeakAlertHint.textContent = currentState.leakAlert
+      ? 'Активен · красная метка RU! при обрыве'
+      : 'Отключён';
+    elLeakAlertHint.title = '';
+  }
+
   if (checkingVpn) {
-    elVpnStatusHint.textContent = 'Проверяю выходной IP...';
+    elVpnStatusHint.textContent = 'Проверяю IP и узел Cloudflare...';
+    elVpnStatusHint.title = '';
     return;
   }
 
   if (!currentState.autoVpn) {
-    elVpnStatusHint.textContent = 'Выкл · ручной выбор региона выше';
+    if (currentVpnStatus.colo || currentVpnStatus.countryCode) {
+      const cfInfo = currentVpnStatus.colo ? ` · CF:${currentVpnStatus.colo}` : '';
+      const txt = `Ручной режим (${currentVpnStatus.countryCode || 'IP'}${cfInfo})`;
+      elVpnStatusHint.textContent = txt;
+      elVpnStatusHint.title = txt;
+    } else {
+      elVpnStatusHint.textContent = 'Выкл · ручной выбор региона выше';
+      elVpnStatusHint.title = '';
+    }
     return;
   }
 
   if (currentVpnStatus.error) {
-    elVpnStatusHint.textContent = `Ошибка проверки IP (${currentVpnStatus.error})`;
+    const msg = `Ошибка проверки (${currentVpnStatus.error})`;
+    elVpnStatusHint.textContent = msg;
+    elVpnStatusHint.title = msg;
     return;
   }
 
@@ -116,23 +166,38 @@ function renderVpnStatus() {
     const loc = currentVpnStatus.city
       ? `${currentVpnStatus.countryCode || 'RU'} · ${currentVpnStatus.city}`
       : (currentVpnStatus.countryCode || 'RU');
-    elVpnStatusHint.textContent = `⚠️ Виден IP ${loc} (VPN выключен?)`;
+    const msg = `⚠️ Виден IP ${loc} — маскировка удержана`;
+    elVpnStatusHint.textContent = msg;
+    elVpnStatusHint.title = msg;
     return;
   }
 
-  if (currentVpnStatus.countryCode || currentVpnStatus.timezone) {
+  if (currentVpnStatus.countryCode || currentVpnStatus.timezone || currentVpnStatus.colo) {
+    const cfTag = currentVpnStatus.colo ? `CF:${currentVpnStatus.colo}` : '';
+    if (currentVpnStatus.splitIp) {
+      elVpnStatusHint.classList.add('hint-warn');
+      const msg = `Разные маршруты! Взят ${cfTag || 'CF'} (${currentVpnStatus.timezone})`;
+      elVpnStatusHint.textContent = msg;
+      elVpnStatusHint.title = 'Cloudflare и GeoIP видят разные выходные IP в вашем прокси. Выбран пояс узла Cloudflare.';
+      return;
+    }
+
     elVpnStatusHint.classList.add('hint-ok');
-    const parts = [currentVpnStatus.countryCode, currentVpnStatus.city].filter(Boolean).join(' · ');
+    const locParts = [currentVpnStatus.countryCode, currentVpnStatus.city, cfTag].filter(Boolean).join(' · ');
     const tzPart = currentVpnStatus.timezone ? ` (${currentVpnStatus.timezone})` : '';
-    elVpnStatusHint.textContent = `IP: ${parts || 'VPN'}${tzPart}`;
+    const full = `${locParts || 'VPN'}${tzPart}`;
+    elVpnStatusHint.textContent = full;
+    elVpnStatusHint.title = full;
     return;
   }
 
   elVpnStatusHint.textContent = 'Ожидание проверки IP...';
+  elVpnStatusHint.title = '';
 }
 
 function updateClockAndSummary() {
   const profile = getProfile(currentState.profileId);
+  const displayTz = getActiveDisplayTz();
 
   if (!currentState.enabled) {
     elClock.textContent = 'Подмена отключена';
@@ -149,7 +214,7 @@ function updateClockAndSummary() {
   try {
     const now = new Date();
     const timeStr = new Intl.DateTimeFormat('en-US', {
-      timeZone: profile.tz,
+      timeZone: displayTz,
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
@@ -157,7 +222,7 @@ function updateClockAndSummary() {
     }).format(now);
 
     const shortTz = new Intl.DateTimeFormat('en-US', {
-      timeZone: profile.tz,
+      timeZone: displayTz,
       timeZoneName: 'shortOffset'
     })
       .formatToParts(now)
@@ -165,11 +230,11 @@ function updateClockAndSummary() {
 
     elClock.textContent = `${timeStr} · ${shortTz}`;
   } catch (_) {
-    elClock.textContent = profile.tz;
+    elClock.textContent = displayTz;
   }
 
   const langLabel = currentState.spoofLang ? profile.locale : 'Системный язык';
-  elSummary.textContent = `${profile.tz} · ${langLabel}`;
+  elSummary.textContent = `${displayTz} · ${langLabel}`;
 }
 
 function renderExcludedChips() {
@@ -206,24 +271,39 @@ function renderExcludedChips() {
 
 function renderUI() {
   const isEnabled = Boolean(currentState.enabled);
+  const isCdp = Boolean(currentState.cdpMode);
   const siteExcluded = isCurrentSiteExcluded();
-  const vpnExposed = isEnabled && Boolean(currentState.autoVpn) && Boolean(currentVpnStatus.exposed);
+  const watchdogOn = Boolean(currentState.autoVpn || currentState.leakAlert);
+  const vpnExposed = isEnabled && watchdogOn && Boolean(currentVpnStatus.exposed);
   const resolvedId = resolveProfileId(currentState.profileId);
   const profile = getProfile(resolvedId);
 
   elEnabled.checked = isEnabled;
   elMain.classList.toggle('disabled', !isEnabled);
   elDot.classList.toggle('off', !isEnabled);
+  elDot.classList.toggle('cdp', isEnabled && isCdp && !vpnExposed && !siteExcluded);
   elDot.classList.toggle('danger', vpnExposed && !siteExcluded);
   elDot.classList.toggle('bypass', isEnabled && siteExcluded);
   elProfileField.classList.toggle('dimmed', isEnabled && siteExcluded);
   elSiteExcludeCard.classList.toggle('active-bypass', isEnabled && siteExcluded);
 
+  elEngineBadge.textContent = isCdp ? 'CDP' : 'JS';
+  elEngineBadge.classList.toggle('cdp-on', isCdp);
+  elEngineBadge.title = isCdp
+    ? 'Чистая C++ эмуляция Chromium (включая Turnstile OOPIF и Web Workers)'
+    : 'Скрытая JS-инъекция на уровне прототипов V8';
+
   elProfile.value = resolvedId;
   elAutoVpn.checked = Boolean(currentState.autoVpn);
+  elLeakAlert.checked = currentState.leakAlert !== undefined ? Boolean(currentState.leakAlert) : true;
   elLang.checked = Boolean(currentState.spoofLang);
-  elLangHint.textContent = `Accept-Language, Intl и голоса (${profile.locale})`;
-  elCdp.checked = Boolean(currentState.cdpMode);
+  elLangHint.textContent = isCdp
+    ? `Нативно через движок + DNR (${profile.locale})`
+    : `Accept-Language, Intl и голоса (${profile.locale})`;
+  elCdp.checked = isCdp;
+  elCdpHint.textContent = isCdp
+    ? 'Активен · 0% JS-патчей · OOPIF и Workers'
+    : 'Без JS-патчей · фреймы Turnstile и Workers';
 
   if (activeDomain) {
     elSiteExcludeRow.classList.remove('disabled-row');
@@ -255,7 +335,7 @@ function renderUI() {
 async function saveState(patch) {
   currentState = Object.assign({}, currentState, patch);
   currentState.profileId = resolveProfileId(currentState.profileId);
-  if (activeDomain) {
+  if (activeDomain && !('leakAlert' in patch && Object.keys(patch).length === 1)) {
     pendingReload = true;
   }
   await chrome.storage.local.set(currentState);
@@ -287,7 +367,7 @@ async function init() {
   if (tab && tab.id) {
     activeTabId = tab.id;
     try {
-      const u = new URL(tab.url || '');
+      const u = new URL(tab.pendingUrl || tab.url || '');
       if (u.protocol === 'http:' || u.protocol === 'https:') {
         activeDomain = normalizeDomain(u.hostname);
       }
@@ -301,6 +381,9 @@ async function init() {
 
   currentState = Object.assign({}, DEFAULT_STATE, stored);
   currentState.profileId = resolveProfileId(currentState.profileId);
+  if (currentState.leakAlert === undefined) {
+    currentState.leakAlert = true;
+  }
   if (!Array.isArray(currentState.excludedSites)) {
     currentState.excludedSites = [];
   }
@@ -308,8 +391,11 @@ async function init() {
   renderUI();
   setInterval(updateClockAndSummary, 1000);
 
-  // Refresh VPN IP on popup open if autoVpn is enabled and last check was >20s ago
-  if (currentState.enabled && currentState.autoVpn && Date.now() - (currentVpnStatus.checkedAt || 0) > 20000) {
+  if (
+    currentState.enabled &&
+    (currentState.autoVpn || currentState.leakAlert) &&
+    Date.now() - (currentVpnStatus.checkedAt || 0) > 20000
+  ) {
     requestManualVpnCheck();
   }
 }
@@ -329,6 +415,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes.autoVpn !== undefined) {
     currentState.autoVpn = Boolean(changes.autoVpn.newValue);
   }
+  if (changes.leakAlert !== undefined) {
+    currentState.leakAlert = Boolean(changes.leakAlert.newValue);
+  }
   renderUI();
 });
 
@@ -337,7 +426,7 @@ elEnabled.addEventListener('change', () => {
 });
 
 elProfile.addEventListener('change', () => {
-  // Choosing a profile manually turns off autoVpn so background polling won't override manual choice
+  // Choosing a profile manually disables auto-switching, while keeping the RU! leak guard active
   saveState({ profileId: elProfile.value, autoVpn: false });
 });
 
@@ -349,10 +438,15 @@ elAutoVpn.addEventListener('change', async () => {
   }
 });
 
-elCheckVpnBtn.addEventListener('click', async () => {
-  if (!currentState.autoVpn) {
-    await saveState({ autoVpn: true });
+elLeakAlert.addEventListener('change', async () => {
+  const enabledLeak = elLeakAlert.checked;
+  await saveState({ leakAlert: enabledLeak });
+  if (enabledLeak) {
+    requestManualVpnCheck();
   }
+});
+
+elCheckVpnBtn.addEventListener('click', async () => {
   requestManualVpnCheck();
 });
 

@@ -1,1 +1,1 @@
-if (window.__TZ_LOCALE_CFG__) window.__TZ_LOCALE_CFG__.spoofLang = true;
+try{const d=Object.getOwnPropertyDescriptor(globalThis,'__tz_s__');if(d&&d.value)d.value.spoofLang=true;}catch(_){}

@@ -14,7 +14,8 @@
         <div>
           <div class="title-row">
             <h1 class="title">Zone &amp; Locale</h1>
-            <span class="ver-badge">v1.5</span>
+            <span class="ver-badge">v1.6</span>
+            <span class="engine-badge" id="engineBadge">JS</span>
           </div>
           <p class="subtitle" id="liveClock">--:-- · UTC</p>
         </div>
@@ -43,7 +44,7 @@
 
       <!-- Profile Dropdown (populated from profiles-data.js) -->
       <div class="field" id="profileField">
-        <label class="field-label" for="profileSelect">Активный сервер / регион</label>
+        <label class="field-label" for="profileSelect">Активный сервер / регион (28 зон)</label>
         <div class="select-wrap">
           <select id="profileSelect"></select>
         </div>
@@ -53,17 +54,28 @@
       <div class="toggles-group">
         <div class="toggle-row toggle-row-static" id="autoVpnRow">
           <label class="toggle-label-stretch" for="toggleAutoVpn">
-            <span class="toggle-title">Авто-выбор по IP (VPN)</span>
-            <span class="toggle-hint" id="vpnStatusHint">Следит за переключением VPN</span>
+            <span class="toggle-title">Авто-пояс по IP + Cloudflare</span>
+            <span class="toggle-hint" id="vpnStatusHint">Сверка GeoIP и узла Cloudflare</span>
           </label>
           <div class="row-actions">
-            <button type="button" class="icon-btn" id="checkVpnBtn" title="Проверить IP и регион сейчас">↻</button>
+            <button type="button" class="icon-btn" id="checkVpnBtn" title="Проверить IP и узел Cloudflare сейчас">↻</button>
             <label class="switch switch-sm">
               <input type="checkbox" id="toggleAutoVpn" checked>
               <span class="slider"></span>
             </label>
           </div>
         </div>
+
+        <label class="toggle-row" id="leakAlertRow">
+          <div class="toggle-text">
+            <span class="toggle-title">Сторож обрыва VPN (RU!)</span>
+            <span class="toggle-hint" id="leakAlertHint">Сигнал даже при ручном выборе региона</span>
+          </div>
+          <span class="switch switch-sm">
+            <input type="checkbox" id="toggleLeakAlert" checked>
+            <span class="slider"></span>
+          </span>
+        </label>
 
         <label class="toggle-row">
           <div class="toggle-text">
@@ -78,10 +90,10 @@
 
         <label class="toggle-row">
           <div class="toggle-text">
-            <span class="toggle-title">Глубокая эмуляция (CDP)</span>
-            <span class="toggle-hint">Уровень движка Chrome и Web Workers</span>
+            <span class="toggle-title">Чистый движок CDP (Anti-CF)</span>
+            <span class="toggle-hint" id="cdpHint">Без JS-патчей · фреймы Turnstile и Workers</span>
           </div>
-          <span class="switch switch-sm">
+          <span class="switch switch-sm switch-teal">
             <input type="checkbox" id="toggleCdp">
             <span class="slider"></span>
           </span>
